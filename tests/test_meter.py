@@ -80,6 +80,7 @@ class GitDeliveryLedgerConnectionTests(unittest.TestCase):
                 ledger.set_last_checked(123)
                 ledger.last_checked()
                 ledger.baseline_at()
+                ledger.coalesce_repository("repo-key", "canonical-key")
                 ledger.clear(123)
         self.assertTrue(created, "ledger operations should open connections")
         leaked = [connection for connection in created if not connection.closed]

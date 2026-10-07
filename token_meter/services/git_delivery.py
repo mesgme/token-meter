@@ -311,7 +311,7 @@ class GitDeliveryLedger:
             or legacy_key == canonical_key
         ):
             return
-        with self._connect() as connection:
+        with self._transaction() as connection:
             coverage = connection.execute(
                 """
                 SELECT repo_key, measured, partial, checked_at
