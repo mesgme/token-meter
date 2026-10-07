@@ -104,18 +104,125 @@ and select it from **Sessions**.
 ### Sessions
 
 **Current sessions** shows recently active runs. **All sessions** searches
-history by project, application, or activity window. Selecting a session opens
-a durable local URL such as `/sessions/<id>#summary`.
+history by project, application, or activity window. Tick the box at the start
+of up to four rows and choose **Compare** to see them side by side in
+**Sessions → Compare**: setup differences, cost, tokens, cache, time, context,
+tools, cumulative cost or tokens by execution, where the cost went, and short
+insights. To judge repeated runs of one prompt, select one run and add the
+other sessions with the same title from the list below the comparison; with
+three or more same-prompt runs, Compare reports the run-to-run spread. Compare
+measures effort, not answer quality, and unavailable evidence shows `--`
+rather than zero. **Sessions → Subagents**
+investigates child-agent runs and issues; the top-level **Subagents** page compares
+roles. Selecting a session opens a
+durable local URL such as `/sessions/<id>#summary`.
 
 Within a session, **Run** shows usage, timing, tool activity, and the session
-budget cap in one view.
+budget cap in one view. When local Claude or Codex evidence establishes a
+parent-child relationship, **Agent activity** adds the main session and its
+descendants with model, activity state, tokens, estimated cost, group share,
+and work time. Work time is the cumulative duration of completed
+prompt-to-response turns. It includes reasoning and tool use, excludes idle
+gaps between prompts and time after completion, and stays unavailable when the
+provider trace cannot establish it. A navigable Codex child opens its own
+session detail. Claude child work stays a structural component of the grouped
+Claude session, so it does not become duplicate top-level spend.
+
+Relative cost color highlights expensive children in their session; exact
+figures remain visible. Explicit investigation signals can include active cost concentration,
+a comparable-peer cost outlier, provider-reported retry or failed-attempt
+pressure, spend above the browser-local session cap, or covered estimated cost
+that increased by at least $0.25 while a child remained active. Cost-derived
+signals are withheld unless the group has complete cost coverage. Token Meter
+does not stop, pause, or change an agent.
+
+Completion state is separate. A stale trace with no terminal provider event is
+shown as **Incomplete**; a terminal trace is **Complete**. Completion and cost
+or retry evidence are separate: a complete agent can still be a cost outlier.
+When Codex reports a safe role such as
+`token_meter_reviewer`, that role is the primary name and the provider nickname
+is secondary. If no role exists, the nickname or a neutral ordinal is used.
+
+The hierarchy displays at most 100 agents and reports any hidden count, while
+its totals continue to cover the full resolved group. Ambiguous, unresolved,
+or cyclic relationships are excluded and relationship coverage becomes
+partial. Missing token or cost evidence remains partial or unavailable rather
+than becoming zero.
+
+**Subagents** counts child work only and groups it by application,
+runtime-scoped model, depth, kind, or provider-reported role. Its bounded
+inventory can be filtered by role or nickname, project, application, model,
+status, attention reason, and activity window. A compact evidence strip keeps
+incomplete agents, cost or retry signals, matching child cost, and cost
+coverage visible without treating a zero-valued signal as a finding. Select an
+**Incomplete** or a signal tag to apply that filter;
+select the active tag again to remove it. Spawned
+and internal Codex children remain separate in model, depth, role, and kind
+cohorts. A role is never inferred from a prompt, filename, or conversation. If
+the inventory reaches its bound, visible rows remain filterable but exact
+filtered totals are withheld.
+
+The dedicated Subagents page contains **Roles** only. It compares provider-reported roles within their
+application and child kind. Three summary metrics separate total named-role
+covered spend, cost per covered run, and run volume, so reduced spend is not
+mistaken for fewer executions. Each role then gets its own trend chart with a
+shared Spend, Cost/run, or Runs mode. Spend and cost-per-run changes compare the
+selected period with the one before it: Today with yesterday up to the same
+time, Yesterday with the day before, 7, 30, or 90 days with the previous period
+of the same length, Month with the same number of days at the start of last
+month, and Last month with the month before. **All history** shows available
+history without a comparison baseline. Each compact role row keeps run count, cost coverage,
+average and p95 estimated cost, incomplete and review counts, and a **View
+runs** action. It opens **Sessions → Subagents**, filtered to that exact role,
+application, and child kind,
+with a model distribution by app and model for matching child runs. Browser Back
+returns to the same Roles state; Forward restores the run list. In Sessions →
+Subagents, **Sessions** keeps every matching child under its parent and shows
+the spawned-run count for each parent. **Issues** shows only parent sessions
+containing an incomplete child or a deterministic attention signal. The run
+filters apply to both investigation views; the view preference is preserved.
+
+Role trends use exact server-side app, project, and time aggregates rather than
+the bounded visible inventory. Search, Model, Status, and Signal are row-level
+filters; while any is active, Token Meter pauses the exact trend and explains
+why instead of mixing incompatible scopes. Known spend and cost per covered run
+remain visible with explicit coverage; cost changes require complete cost
+evidence in both compared periods. Lower spend does not
+establish better output or a successful task.
+
+Select a child in Issues or Sessions → Subagents to keep the parent list visible while the
+inspector shows identity, lifecycle, cost, tokens, work time, executions,
+tool calls, retry evidence, sibling position, comparable-agent cost evidence,
+and the exact reasons for a review signal. **Open parent session** moves to the
+normal session detail and its full Agent activity hierarchy. Parent titles are
+resolved from the existing local session history; no prompt or response text
+is added to the child-agent projection.
+
+OpenCode child runs are counted in every total from the moment they exist, because
+an OpenCode parent session's cost does not include its children. To keep the All
+sessions list readable, those runs are not listed as rows by default. Their spend
+still appears in global totals, and the row-count line states how much subagent
+spend is counted and listed under parents. Each parent session card carries a
+**Subagents** subsection showing its child runs inline with the reported role,
+model, tokens, and cost; selecting one opens that run like any other session. Use
+the **Subagents** filter, set to **Hidden** or **Listed**, to include child runs as
+their own rows. The All sessions header figures include child-run spend in both
+modes, and searching in **Hidden** mode finds a child run by showing its parent
+session card. Nested runs appear under their top-level session. A child run
+priced at $0.00 on a free tier shows a measured zero rather than missing billing.
+Archiving an OpenCode session removes it and its child runs from Token Meter.
+
+While a child run is active, it appears as part of its parent's current session:
+the parent's live cost and session cap include every child run, and a child run
+has no separate cap.
 
 Session deletion is available only where the runtime and platform expose a
 safe, recoverable target.
 
 ### Spend
 
-Spend supports Today, 7-day, 30-day, This month, and custom calendar ranges.
+Spend supports Today, Yesterday, 7 days, 30 days, 90 days, Month, Last month,
+All history, and Custom calendar ranges.
 Use its daily bars, platform split, projects, runtimes, and highest-cost logs to
 understand where usage accumulated. Partial and locally estimated costs remain
 explicitly labeled. Session economics shows the share attributable to the top
@@ -165,12 +272,11 @@ share, spend concentration, and remaining coverage gaps. Daily shape gives the
 median and high day for Spend / 1K, lines per push day, and push yield. Five or
 more qualifying days show the middle half; smaller samples show the observed
 range. A hollow marker means the high day sits beyond the rail scale, and the
-exact value stays in the numbers column. Cost by pushed lines plots each day on
-log axes with a diagonal at the period's average Spend / 1K, so points above the
-diagonal cost more per line than the period average; selecting a point focuses
-that day in the daily chart. Days below 50 comparable pushed lines stay visible
-as hollow context points, while ratio distributions and ranked outliers exclude
-them. Signals with a specific day, project, or coverage gap link to that evidence.
+exact value stays in the numbers column. Days below 50 comparable pushed lines
+are excluded from ratio distributions and ranked outliers. Code per dollar by
+model estimates lines per dollar for each model, app, and reasoning effort by
+splitting each comparable project's pushed lines by that model's share of the
+project's covered spend; models working in the same project share its rate. Signals with a specific day, project, or coverage gap link to that evidence.
 Ratios describe only projects with comparable evidence; projects outside that
 coverage may change the result. Every reading here is a statistic, not a quality
 judgment.
@@ -187,10 +293,10 @@ older reflog entries are not imported again.
 
 ### Settings
 
-Settings contains the default session budget, monthly budget allocations and
+Settings contains the default session budget, server-persisted per-session caps, monthly budget allocations and
 thresholds, effective-dated model pricing, Git evidence history, software updates,
-menu-bar preferences, language signals, and local agent connections. The default session
-budget applies whenever that browser has no saved cap for a session; changing it
+menu-bar preferences, and local agent connections. The default session
+budget applies whenever a session has no saved cap; changing it
 does not replace existing per-session caps. Model pricing shows the review date
 and provider sources for bundled rates. Select the models to change, edit their
 prices, choose **From now**, **From date**, or **All history**, and save them
@@ -210,7 +316,7 @@ Menu-bar title fields and quota notifications are configurable in Settings.
 
 ## Ask From Codex or Claude
 
-Open **Settings → Agent connections** to connect the read-only local MCP entry
+Open **Settings → Agent connections** to connect the local MCP entry
 named `tokenmeter`. Start a new agent session after connecting.
 
 The bounded tools are:
@@ -218,6 +324,12 @@ The bounded tools are:
 - `mcp__tokenmeter__check` for the caller-matched current run and optional
   execution drill-down;
 - `mcp__tokenmeter__usage` for aggregate spend, model, tool, or change review;
+- `mcp__tokenmeter__budget` for the effective selected-session cap, estimated
+  spend, remaining amount, and threshold state;
+- `mcp__tokenmeter__set_session_budget` to set a matched or selected session
+  cap, with `confirm: true` and optional compare-and-set protection;
+- `mcp__tokenmeter__set_default_session_budget` to change the default cap for
+  sessions without an override, with `confirm: true`;
 - `mcp__tokenmeter__capabilities` for named user-installed skill-pack evidence;
 - `mcp__tokenmeter__sessions` for content-free session selection by runtime,
   client, model, state, and time;
@@ -336,6 +448,15 @@ not establish them. A provider resource identifier, such as an
 application-profile reference, is replaced with a safe generic model label;
 Token Meter does not infer or price a foundation model from it.
 
+Pi child runs started by the `subagent` tool are counted in the owning
+session's totals and appear under **Sessions → Subagents** and in the selected
+session's agent group with their provider-reported agent name, model, duration,
+and completion state. Token Meter reads only the structural result fields of
+that tool; child prompts, tasks, messages, stderr, and outputs stay unread. A
+child that reports no usage keeps its tokens and cost unavailable rather than
+zero, and a session with more child runs than Token Meter retains shows its
+totals as unavailable rather than as a complete figure.
+
 ### Costs and estimates
 
 Token Meter uses effective-dated provider/model price periods. Reinstalling
@@ -369,6 +490,11 @@ The dashboard can display local project paths, runtime/model names, capability
 names, and derived metrics. See [SECURITY.md](SECURITY.md) and the
 [architecture privacy invariants](ARCHITECTURE.md#privacy-and-security-invariants)
 for the complete boundary.
+
+Agent activity and subagent statistics project only opaque relationships,
+bounded provider-reported labels and roles, model/activity fields, and numeric
+usage evidence. Prompts, responses, reasoning, tool contents, commands, raw
+provider events, agent-definition paths, and trace paths are excluded.
 
 ## Troubleshooting
 

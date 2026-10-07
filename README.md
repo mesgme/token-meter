@@ -66,8 +66,8 @@ troubleshooting, see the [User guide](specs/USER_GUIDE.md).
 
 | Goal | Token Meter helps you |
 | --- | --- |
-| **Understand a live run** | Follow estimated cost, tokens, context pressure, wait, output pace, tool calls, execution evidence, and session-budget alerts. |
-| **Review history and spend** | Find expensive or slow work across sessions, projects, runtimes, platforms, and calendar ranges. |
+| **Understand a live run** | Follow estimated cost, tokens, context pressure, wait, output pace, tool calls, execution evidence, session-budget alerts, and supported Claude or Codex child-agent activity. |
+| **Review history and spend** | Find expensive or slow work across sessions, projects, runtimes, platforms, calendar ranges, and child-agent cohorts. |
 | **Compare models and execution** | Compare input, output, pace, wait, and workload shape without presenting weak matches as meaningful results. |
 | **Investigate tools and skills** | Find high-output, failing, repeated, unobserved, or deferred capabilities while keeping incomplete evidence explicit. |
 | **Manage usage** | Check provider-reported limits, allocate a monthly budget, receive threshold notifications, and let Codex or Claude query bounded evidence through the local MCP. |
@@ -90,20 +90,58 @@ Token Meter works when the agent keeps session evidence on your machine in a
 supported local store. Sessions that exist only in a cloud-hosted service may
 not be available to Token Meter.
 
+### Pi coding-agent sessions
+
+Pi support reads local session JSONL files and shows only content-free usage
+evidence. When present, Token Meter shows recorded input, output, cache, local
+cost, and tool-call evidence. Wait time
+is inferred from user-to-assistant timestamps, not measured output speed.
+Context pressure, output speed, cache savings, and semantic token classification
+remain unavailable. Pi cost is the estimate persisted in its local session;
+Token Meter does not infer a model or price from provider resource identifiers.
+Pi `subagent` child runs are counted in the owning session's totals and listed
+with their provider-reported agent name, model, duration, and activity. Only the
+structural result fields are read; child prompts, tasks, messages, and error
+output stay unread, and an unreported child figure remains unavailable rather
+than zero.
+
 ## First Five Minutes
 
 1. Open **Sessions → Current sessions** and select an active run.
 2. Under **Run**, check cost, context pressure, Output/$, and Reasoning ratio.
+   For a supported Claude or Codex run, use **Agent activity** to inspect its
+   child hierarchy, covered estimated cost, and explained attention signals.
    Add a session budget if the run needs an attention limit.
-3. After more sessions accumulate, use **Spend**, **Models**, **Tools**,
+3. After more sessions accumulate, use **Spend**, **Models**, **Subagents**, **Tools**,
    **Efficiency**, and **Git** to review longer-term patterns.
 
 ## Product Tour
 
 ### Follow a session
 
-Run keeps usage, execution, tool, and budget evidence together on one focused
-session page.
+Run keeps usage, execution, tool, budget, and supported child-agent evidence
+together on one focused session page. **Agent activity** shows a bounded local
+hierarchy for Claude and Codex when their traces establish one. Relative cost
+color and explicit retry evidence help identify runs worth inspecting; neither
+is a diagnosis or changes an agent. The dedicated **Subagents** page compares
+named roles over time. **Sessions → Subagents** filters child-agent runs by
+project, application, model, completion state, evidence signal, and time. Provider-reported roles such as
+`token_meter_reviewer` are shown as the primary identity when available;
+provider nicknames remain a fallback. A stale nonterminal trace is labeled
+**Incomplete**, independently of any attention signal. OpenCode child runs are
+counted in totals from the start, because an OpenCode parent's cost excludes its
+children; they are not listed as own rows by default and instead appear in a
+**Subagents** subsection inside each parent session card, with a **Subagents**
+filter to list them instead. A live child run counts toward its parent's current
+session and session cap rather than appearing as a separate session. The default **Roles**
+view gives every named role its own spend, cost-per-run, or run-volume trend,
+compares equal periods when coverage permits, and links each role cohort to its
+runs under Sessions, with a matching-run model breakdown. Covered spend and cost per covered run remain visible when some runs lack
+cost; coverage is shown, and incomplete periods have no cost-change claim.
+**Work time** sums completed prompt-to-response durations, including
+reasoning and tool use while excluding gaps between prompts; missing timing
+evidence remains unavailable. Browser Back returns from that drill-down to the
+same Roles filters.
 
 <p align="center">
   <img src="images/dashboard.png" alt="Token Meter session detail with live cost, token, context, and execution metrics" width="900">
@@ -111,8 +149,8 @@ session page.
 
 ### Understand spend
 
-Compare Today, 7-day, 30-day, This month, or a custom period across platforms,
-projects, runtimes, and sessions. Spend concentration, percentile session
+Compare Today, Yesterday, 7, 30, or 90 days, Month, Last month, All history, or a
+custom period across platforms, projects, runtimes, and sessions. Spend concentration, percentile session
 shapes, and a clickable cost-or-input versus active-time map expose which runs
 deserve inspection.
 
@@ -140,14 +178,14 @@ Use **Efficiency** to compare four signals over comparable, covered work:
   more reasoning.
 - **Context load**: processed input tokens per output token. Lower is better
   because less context is carried into each response.
-- **Output / execution**: output tokens per covered run. Higher generally means
-  a less fragmented workflow.
+- **Cache hit ratio**: cache-read tokens as a share of cache-covered input.
+  Higher is usually better because more context is served from the prompt cache.
 
 Each headline includes a daily trend, and partial coverage or unavailable
 evidence stays labelled beside the numbers.
 
 <p align="center">
-  <img src="images/efficiency.png" alt="Token Meter Efficiency page with output per dollar, reasoning ratio, context load, and output per execution" width="900">
+  <img src="images/efficiency.png" alt="Token Meter Efficiency page with output per dollar, reasoning ratio, context load, and cache hit ratio" width="900">
 </p>
 
 ### Git
@@ -163,20 +201,23 @@ signal, not a code-quality or productivity score.
 
 ### Configure budgets and agent access
 
-Manage monthly budgets, model pricing, language signals, native preferences,
-and local read-only connections for Codex and Claude. Software update checks
+Manage monthly budgets, model pricing, native preferences, and local agent
+connections for Codex and Claude. Software update checks
 and automatic installation are separate settings; both are on by default.
 
 <p align="center">
-  <img src="images/mcp.png" alt="Token Meter Settings view for local read-only agent connections" width="900">
+  <img src="images/mcp.png" alt="Token Meter Settings view for local agent connections" width="900">
 </p>
 
-The local MCP exposes seven read-only tools:
+The local MCP exposes eight read-only evidence tools plus two explicit session-budget setters:
 
 | Tool | Use |
 | --- | --- |
 | `check` | Make a bounded decision about the caller-matched current run. |
 | `usage` | Review aggregate spend, model, tool, or change evidence. |
+| `budget` | Read the matched or selected run's effective cap, estimated spend, remaining amount, and threshold state. |
+| `set_session_budget` | Set one matched or selected run's cap; requires `confirm: true`. |
+| `set_default_session_budget` | Change the default cap for new/unoverridden runs; requires `confirm: true`. |
 | `capabilities` | Review optional user-installed skill-pack evidence. |
 | `sessions` | Select content-free session IDs using runtime, client, model, state, or time filters. |
 | `trace` | Read a standardized trace or sanitized runtime-native structure for one session. |
@@ -193,6 +234,9 @@ The `native_structure` trace view is not raw trace content. It keeps only
 allowlisted event types/subtypes, model and tool identities, statuses,
 relationships, timestamps, and numeric evidence. It does not expose raw trace
 content, prompts, responses, reasoning text, tool payloads, or trace paths.
+Budget setters accept only USD caps in Token Meter's validated range. They do
+not alter monthly allocations or pricing. Use `expected_current_budget_usd`
+when a concurrent update must fail rather than overwrite a changed cap.
 
 ### Check without opening the dashboard
 
@@ -215,8 +259,13 @@ costs, or derived analytics. Do not expose the localhost dashboard publicly.
 
 Costs and selected token values can be estimates. Codex cost uses public
 API-equivalent rates, which can differ from subscription billing; Cursor usage
-includes local proxies where authoritative values are unavailable; Pi cost are
-estimates based on model API pricing.
+includes local proxies where authoritative values are unavailable; Pi cost is
+the local estimate persisted in its session record.
+
+Subagent views use only content-free structural relationships and existing
+usage evidence. They do not expose prompts, responses, reasoning, tool
+contents, commands, or trace paths. Partial relationship, token, or cost
+coverage stays explicitly partial or unavailable.
 
 The optional MCP returns bounded derived evidence, not prompts, responses,
 reasoning, tool contents, credentials, settings, or trace paths. A result sent

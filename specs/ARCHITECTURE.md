@@ -23,7 +23,7 @@ flowchart LR
   mcp_queries["MCP query validation, schema, and allowlists"]
   browser["Browser dashboard"]
   native["macOS, Linux, and Windows companions"]
-  mcp["Read-only local MCP"]
+  mcp["Bounded local MCP"]
 
   traces --> adapters --> contracts --> domain --> app --> projections
   projections --> browser
@@ -42,16 +42,16 @@ executable and import-compatibility facade; current composition lives in
 | --- | --- | --- |
 | Runtime identity and discovery | `token_meter/runtimes/` | Find sources, compute revisions, read inputs safely, parse runtime formats, and return normalized evidence. |
 | Shared evidence contracts | `token_meter/contracts.py`, `token_meter/compat.py` | Keep runtime, model provider, account provider, source locator, availability, and provenance distinct; preserve bounded compatibility shapes. |
-| Usage and analytics | `token_meter/domain/` | Calculate costs, timing, throughput, tools, insights, daily/model/session aggregates, and evidence coverage without runtime dispatch. |
+| Usage and analytics | `token_meter/domain/` | Calculate costs, timing, throughput, tools, agent relationships, insights, daily/model/session aggregates, and evidence coverage without runtime dispatch. |
 | Model identity and prices | `token_meter/models/` | Resolve provider-scoped model names and effective-dated prices. |
 | Provider limits | `token_meter/quotas/` | Make bounded, read-only account-usage requests and normalize available quota windows. |
 | Operating-system behavior | `token_meter/platforms/` | Own host paths, process policy, updates, service integration, and recoverable trash behavior. |
 | Application lifecycle | `token_meter/app.py`, `token_meter/services/` | Compose registries, manage caches/settings/watchers, and serve application jobs. |
-| Public projections | `token_meter/projections.py` | Allowlist fields for session, state, model, menu-bar, and MCP consumers. |
+| Public projections | `token_meter/projections.py` | Allowlist fields for session, state, model, browser-only agent, menu-bar, and MCP consumers. |
 | MCP query layer | `token_meter/mcp/` | Validate filters, bind opaque cursors to query revisions, positively allowlist standardized and native-structure fields, aggregate metrics, and publish schema metadata. |
 | HTTP transport | `token_meter/web/`, `page.html` | Serve the loopback API, routes, actions, and the single-file dashboard. |
 | Native clients | `menubar/`, Windows scripts | Render the compact `/menubar` payload and delegate deep review to the browser. |
-| Local MCP | `token_meter_mcp.py` | Return bounded read-only current-run or aggregate evidence over stdio. |
+| Local MCP | `token_meter_mcp.py` | Return bounded current-run or aggregate evidence over stdio, plus explicitly confirmed session-budget updates. |
 | Packaging | `runtime-manifest.txt`, `token_meter/packaging.py`, `scripts/` | Stage one manifest-owned runtime and install platform-native lifecycle components. |
 | Telemetry mapping | `token_meter/telemetry/` | Produce a pure OpenTelemetry-shaped mapping from an immutable privacy projection; perform no export or I/O. |
 
@@ -97,6 +97,50 @@ model-and-numeric-usage prefixes before native load, legacy detail, or legacy
 summary parsing. Ambiguous lineage retains all evidence. Runtime-neutral
 aggregation never reopens traces or performs a second deduplication.
 
+Subagent observability reuses each adapter's corrected accounting. Codex adds
+an agent edge only for an explicit bounded `thread_spawn` relationship, hashes
+private physical identities into separate opaque agent identities, and keeps
+public session identity only as optional navigation. Structurally consistent
+duplicate physical parent records collapse in the relationship overlay while
+remaining ambiguous to accounting lineage; fork-only lineage remains
+accounting lineage rather than a visible agent edge.
+Claude assigns each canonical message UUID to one structurally nested owner,
+keeps the first owner while allowing a later duplicate/update to improve usage,
+and reconciles component totals to the existing grouped session before
+publishing a hierarchy. A reconciliation mismatch omits the breakdown instead
+of changing the established total. Stale nonterminal provider traces are
+classified as `incomplete`; that lifecycle state is independent of the
+deterministic cost/retry attention signals.
+Subagent `work_time_s` is derived only from each adapter's completed
+prompt-to-response timing samples. It includes reasoning and tool execution
+within a response but excludes inter-prompt gaps, open responses, and idle time
+after completion. Missing component-level timing evidence remains unavailable;
+the relationship layer never substitutes timestamp lifespan.
+
+OpenCode is additive rather than grouped. A parent session's reported cost
+excludes its child sessions, and child message sets do not overlap the parent, so
+Token Meter never subtracts child cost from a parent (a test pins this
+assumption), and child sessions are discovered and counted as independent sessions instead of
+being folded into a parent headline the way Claude and Codex require. Each
+session's root ancestor and depth are resolved with a bounded, cycle-safe walk;
+an archived session excludes its whole family from discovery, and a child whose
+parent record is missing produces no agent edge while remaining a counted
+session. Only the resolved root session id is published on a child row. Parent linkage comes only from `session.parent_id`;
+`message.parentID` is a message-level reference and never a session relationship.
+The provider-reported `session.agent` value is the bounded child role, and a
+child's project resolves from its parent root's directory rather than its own
+agent column. A reported child cost of zero is a measured free-tier price and
+stays available evidence; it is never treated as missing pricing.
+A child whose parent record is missing is counted in totals but has no group.
+The loader reports the count and covered cost of those unattributed records, the
+browser discloses them on the Subagents page, and the All sessions row-count line
+separates runs shown under a parent card from runs with no parent session, so a
+coverage gap is stated rather than left looking complete. For current sessions,
+menu-bar recents, and session caps, child runs fold into their root session:
+the root's live row and cap include every child's measured spend, and a child
+has no separate current row or cap. A folded figure is available when any member
+is measured and is marked partial (a lower bound) when any member is not.
+
 The Pi adapter reads only Pi-owned JSONL session files and accepts a source only
 when it has the expected Pi session header. It projects recorded usage, local
 cost, structural tool evidence (including per-call error status), and inferred
@@ -109,13 +153,34 @@ establish a context window size, time to first token, semantic token split, or
 cache-savings price, so those projections remain unavailable rather than being
 derived or reported as zero.
 
+Pi child runs invoked through the `subagent` tool are read from the parent
+transcript's tool-result structure only: the adapter keeps the bounded agent
+name and nested usage, adds the child spend to the owning session's totals,
+model statistics, and daily cost, and emits one `root` record plus one
+`spawned` record per observable child run. Child prompts, tasks, messages,
+stderr, and outputs are never read. A top-level result `usage` is authoritative
+when Pi reports one and a per-child split is attributed only when it reconciles
+exactly; otherwise one aggregate run carries the total. A run without usage
+evidence reports unavailable tokens and cost and makes the session coverage
+partial rather than folding an unknown into a complete total; the same holds
+when the bounded child-run cap drops a call or child. A child whose
+model is unreported or fails sanitization is attributed to an explicit
+`unknown-model` key, never to the parent's model. A root agent record derives
+its own completion from the final assistant turn's recorded stop reason, while
+the session summary row keeps its pre-existing nonterminal behavior so sessions
+without subagent calls do not change.
+
 ## Domain and Model Flow
 
 `token_meter/domain/usage.py` and `token_meter/models/` resolve token counts,
 effective-dated prices, estimates, availability, and provenance. Timing and
 throughput live in `domain/timing.py`; tool/capability evidence in
 `domain/tools.py`; derived guidance in `domain/insights.py`; and cross-session,
-daily, model, language, and tool aggregation in `domain/aggregates.py`.
+daily, model, and tool aggregation in `domain/aggregates.py`.
+`domain/agents.py` resolves only adapter-supplied opaque relationships, rejects
+ambiguous or cyclic graphs, preserves exact full-group totals behind a
+100-agent display bound, and aggregates child-only cohorts. Runtime adapters
+remain responsible for identity, attribution, deduplication, and pricing.
 
 Exact totals are not truncated. Lists used for workload shape, pace matching,
 UI previews, or response-size control are bounded and must disclose their
@@ -127,12 +192,48 @@ catalog data; it should not require a runtime adapter or client change. Longest
 valid prefix matching and historical price boundaries are compatibility
 contracts.
 
+Matched-pace comparison is per model-runtime pair. Each pair compares its two
+completed-turn histories in full, so its cost grows with the product of the two
+sample counts and a single long history can dominate cross-session aggregation.
+Comparisons are therefore cached per pair, keyed by the local day plus a digest
+of each side's samples, so a new turn for one model rebuilds only the pairs that
+model takes part in and a day rollover never reuses previous-day windows. The
+global pair cache is bounded, written to the Token Meter state directory only
+when an entry changed, and reloaded on start with per-entry validation that
+rebuilds each comparison from the builder's exact key allowlist, bounds every
+number, and skips a malformed entry without failing the request, so a restart
+reuses unchanged pairs instead of rebuilding every pair. Once the cap is
+reached, new pairs are computed but not admitted, so cached pairs are never
+evicted and an unchanged over-cap history is never rewritten. Project-scoped
+model stats compute from a private, unpersisted pair cache and never evict or
+overwrite global entries. Only model and runtime identifiers and aggregate
+duration, token, ratio, and coverage values are stored; the file carries no
+prompt, response, tool, path, or raw trace content. Persistence is enabled only
+by the server entrypoint, so importing the module never writes the user's
+cache. A rebuild runs outside the cache lock and is single-flighted, so one
+slow rebuild neither blocks requests that already have fresh data nor runs
+concurrently with itself.
+
 ## Application State and Caching
 
 `token_meter/app.py` composes runtime, quota, and platform registries and owns
 the background watcher. Runtime revisions invalidate only affected source
 summaries. Cross-session state is reused by `/state`, `/session`, Models, Daily,
 Tools, the menu bar, and MCP instead of being recomputed per request.
+The same cache holds private resolved agent groups. `/state` exposes only
+anonymous child-agent cohorts and `/session` exposes only the selected
+allowlisted group; neither native nor MCP projections receive these browser
+fields.
+
+`/session/compare?ids=` projects one to four selected traces through
+`token_meter/domain/compare.py`: an allowlisted, content-free record per trace
+(no paths, prompts, or per-execution text), best-per-metric markers, rule-based
+insights, and other sessions whose public title matches. Selection uses an
+opaque per-trace key (a hash of the trace path, mirrored in `page.html`,
+falling back to the session id) because forked and spawned threads can share a
+session id and some runtimes reuse one file name per session directory; All
+sessions rows use the same key for DOM identity. Each compared trace also
+carries an `open_id` that resolves to exactly that trace when possible.
 
 Filesystem modification time is a revision signal, not automatically user/model
 activity. Adapters derive semantic activity from trace events or authoritative
@@ -153,8 +254,9 @@ allowlisted fields or discovered canonical identifiers.
 ## Client Interfaces
 
 The browser polls live state and renders all top-level review surfaces from
-`page.html`. Dashboard order is `Sessions → Spend → Models → Efficiency → Git →
-Learn → Tools → Settings`; Sessions owns Current and All session modes. Efficiency derives
+`page.html`. Dashboard order is `Sessions → Spend → Models → Subagents → Efficiency → Git →
+Learn → Tools → Settings`; the top-level Subagents page owns Roles, while Sessions owns
+Current, All, and Subagents investigation (child-run Sessions and Issues). Efficiency derives
 mechanical token-efficiency ratios and daily trends from the same runtime-scoped
 model aggregates. Its sortable model table defaults to spend descending and
 preserves unavailable and partial evidence. A Claude thinking-block observation
@@ -163,7 +265,32 @@ output for an unavailable thinking-token split. The selected-session Run surface
 reuses those same aggregate formulas for a compact Output/$ and Reasoning ratio
 module. `/session` projects that selected source's bounded model statistics
 directly, so older All Sessions entries do not depend on the 60-row cross-session
-preview. Charts and model comparison remain on the top-level Efficiency route.
+preview. Agent activity is contained in the selected-session Run surface, and
+child-only filtering is contained in Sessions → Subagents, while exact role
+aggregate statistics are shown on the top-level Subagents page. A content-free inventory is positively allowlisted and bounded to
+1,000 child rows; the browser withholds exact filtered totals when that bound
+is reached. Server-side
+attention signals use explicit thresholds for covered cost concentration,
+comparable-peer outliers, and reported retry pressure. The browser may add the
+saved session-cap and observed-live-growth reasons only when group cost is
+fully covered. Every reason is explanatory and non-mutating. Charts and model
+comparison remain on the top-level Efficiency route. Child usage is
+pre-aggregated into bounded all-history and fixed activity-window scopes, with
+exact project and runtime variants rooted in the initiating session, so
+supported Subagents project/runtime/time comparisons never aggregate
+from the visible All Sessions row slice. Non-all scopes also carry the
+immediately preceding equal-duration comparison body. Named provider roles are
+additionally aggregated into a content-free local-calendar daily series,
+bounded to 4,000 role/day/project/runtime/kind rows with explicit truncation
+metadata. The Roles workspace uses those structures to render one spend,
+average-cost-per-run, or volume trend per role; it never derives exact trend
+totals from the 1,000-row visible inventory. Known role spend remains visible
+when some runs lack cost; cost per run divides by cost-covered runs only, with
+coverage explicit. Cost changes require complete coverage in both compared
+periods. Role, nickname, model, status,
+signal, and text filters operate only on that bounded child inventory, so the
+browser suspends role trends while a filter not represented by the aggregate is
+active.
 Git reads bounded local remote-tracking reflogs. The installer seeds
 readable history in its invoking app's context, then the background service
 rechecks accessible repositories every five minutes. This preserves useful
@@ -176,20 +303,22 @@ already-aggregated daily output and reasoning totals to expose Output / $,
 pushed lines per 1K covered output tokens, spend-weighted coverage, and a
 trailing seven-day cost-intensity series. This association stays at
 project/day and selected-period scope; it does not attribute pushed code to a
-session or model. Public project discriminators use the ledger's per-machine
+session. The per-model table is an estimate: each comparable project's pushed
+lines are split across model, runtime, and reasoning-effort rows by their share
+of that project's covered spend in the period. Public project discriminators use the ledger's per-machine
 salt. Clearing the ledger establishes a timestamped baseline so older reflogs
 do not repopulate it. The service does not contact remotes.
 
 The Git page's Delivery economics surfaces are derived in the browser from that
 same projection; they add no field, endpoint, or stored state. Ranked signals,
-daily distributions, and the day cost map are pure functions over the returned
+and daily distributions are pure functions over the returned
 days, project rows, availability flags, and comparison values. Coverage
 exploration and project evidence filters classify those flags as comparable,
 spend only, Git only, or unavailable without changing the underlying payload.
-The daily chart, cost map, and actionable signals share a transient selected-day
+The daily chart and actionable signals share a transient selected-day
 state. Per-day ratio insights require a minimum pushed-line denominator so a
 near-zero day cannot present a meaningful distribution value; those days remain
-visible as explicitly low-volume context points. Fewer than five qualifying days
+visible as explicitly low-volume context. Fewer than five qualifying days
 use an observed range rather than interpolated quartiles, and a measure without
 qualifying days renders as unavailable rather than zero. Period ratios remain
 conditional on comparable projects and are not described as lower or upper
@@ -200,7 +329,9 @@ Windows NotifyIcon clients read the compact `/menubar` projection and use the
 runtime catalog for generic labels, colors, and capabilities. Provider quota
 views use cached normalized windows; unavailable is never rendered as 0%.
 
-The optional MCP server is local stdio, read-only, and independently bounded.
+The optional MCP server is local stdio and independently bounded. Its evidence
+tools are read-only; its two budget setters require explicit confirmation and
+can mutate only the validated per-session/default cap store.
 Its decision tools use caller-matched or aggregate projections. Its `sessions`,
 `trace`, `stats`, and `schema` query tools select content-free session IDs, read
 one standardized or sanitized-native trace, aggregate only standardized

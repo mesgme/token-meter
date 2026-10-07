@@ -59,7 +59,69 @@ def assistant(message_id, usage, timestamp="2026-09-07T00:00:00.000Z"):
     }
 
 
+def user_prompt(timestamp):
+    return {
+        "type": "user",
+        "timestamp": timestamp,
+        "message": {"content": [{"type": "text", "text": "private prompt"}]},
+    }
+
+
+def turn_duration(duration_ms, timestamp):
+    return {
+        "type": "system",
+        "subtype": "turn_duration",
+        "timestamp": timestamp,
+        "durationMs": duration_ms,
+    }
+
+
 class ClaudeCostCalculationTests(unittest.TestCase):
+    def test_sonnet_5_5_us_inference_uses_published_multiplier(self):
+        usage = claude_usage(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read=1_000_000,
+            cache_write_5m=1_000_000,
+            cache_write_1h=1_000_000,
+            inference_geo="us",
+        )
+        self.assertTrue(meter.claude_billing_supported(usage, "claude-sonnet-5-5"))
+        cost = meter.cost_of(usage, "claude-sonnet-5-5", "claude")
+        for component, value in {
+            "input": 2.2,
+            "cache_write": 7.15,
+            "cache_read": 0.22,
+            "output": 11.0,
+            "server_tools": 0.0,
+        }.items():
+            self.assertAlmostEqual(cost[component], value)
+
+    def test_opus_5_5_fast_us_pricing_uses_published_multipliers(self):
+        cost = meter.cost_of(
+            claude_usage(
+                input_tokens=1_000_000,
+                output_tokens=1_000_000,
+                cache_read=1_000_000,
+                cache_write_5m=1_000_000,
+                cache_write_1h=1_000_000,
+                speed="fast",
+                inference_geo="us",
+            ),
+            "claude-opus-5-5",
+            "claude",
+        )
+
+        expected = {
+            "input": 8.8,
+            "cache_write": 28.6,
+            "cache_read": 0.44,
+            "output": 44.0,
+            "server_tools": 0.0,
+        }
+        for component, value in expected.items():
+            self.assertAlmostEqual(cost[component], value)
+
     def test_five_minute_and_one_hour_cache_writes_use_distinct_rates(self):
         cost = meter.cost_of(
             claude_usage(
@@ -375,6 +437,135 @@ class ClaudeGroupedDiscoveryTests(unittest.TestCase):
         self.assertEqual(loaded.usage.output_tokens.value, 3)
         self.assertEqual(len(loaded.turns), 2)
 
+    def test_nested_subagent_summary_reconciles_private_component_ownership(self):
+        self.adapter.compatibility = meter._claude_compatibility()
+        source = self.adapter.discover_legacy(
+            DiscoveryContext(home=str(self.root)),
+        )[0]
+
+        summary = self.adapter.summarize_legacy(source)
+        records = summary["_agent_records"]
+        root, child = records
+
+        self.assertEqual(root["id"], source["id"])
+        self.assertEqual(root["kind"], "root")
+        self.assertIsNone(root["parent_id"])
+        self.assertEqual(root["depth"], 0)
+        self.assertEqual(root["tokens"], 11)
+        self.assertEqual(child["kind"], "spawned")
+        self.assertEqual(child["parent_id"], root["id"])
+        self.assertEqual(child["depth"], 1)
+        self.assertEqual(child["tokens"], 22)
+        self.assertEqual(child["label"], "")
+        self.assertIsNone(child["role"])
+        self.assertIsNone(child["session_id"])
+        self.assertEqual(sum(row["tokens"] for row in records), summary["tokens"])
+        self.assertAlmostEqual(
+            sum(row["cost"] for row in records), summary["cost"], places=12,
+        )
+        encoded = repr(records)
+        self.assertNotIn(str(self.nested), encoded)
+        self.assertNotIn("agent-one", encoded)
+        self.assertNotIn("private response", encoded)
+
+    def test_nested_components_report_completed_work_time_not_wall_lifespan(self):
+        self.adapter.compatibility = meter._claude_compatibility()
+        self.main.write_text("".join((
+            json.dumps(user_prompt("2026-09-07T00:00:00.000Z")) + "\n",
+            json.dumps(assistant(
+                "root-work", claude_usage(input_tokens=10, output_tokens=1),
+                "2026-09-07T02:00:00.000Z",
+            )) + "\n",
+            json.dumps(turn_duration(
+                600000, "2026-09-07T02:00:00.000Z",
+            )) + "\n",
+            json.dumps(user_prompt("2026-09-07T02:30:00.000Z")) + "\n",
+        )))
+        self.nested.write_text("".join((
+            json.dumps(user_prompt("2026-09-07T03:00:00.000Z")) + "\n",
+            json.dumps(assistant(
+                "child-work", claude_usage(input_tokens=20, output_tokens=2),
+                "2026-09-07T04:00:00.000Z",
+            )) + "\n",
+            json.dumps(turn_duration(
+                120000, "2026-09-07T04:00:00.000Z",
+            )) + "\n",
+        )))
+        source = self.adapter.discover_legacy(
+            DiscoveryContext(home=str(self.root)),
+        )[0]
+
+        root, child = self.adapter.summarize_legacy(source)["_agent_records"]
+
+        self.assertEqual(root["work_time_s"], 600)
+        self.assertEqual(child["work_time_s"], 120)
+
+    def test_stale_nonterminal_components_are_incomplete(self):
+        self.adapter.compatibility = meter._claude_compatibility()
+        for path in (self.main, self.nested):
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            for row in rows:
+                row["message"]["stop_reason"] = None
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        source = self.adapter.discover_legacy(
+            DiscoveryContext(home=str(self.root)),
+        )[0]
+
+        with mock.patch("token_meter.runtimes.claude.time.time", return_value=2_000_000_000):
+            records = self.adapter.summarize_legacy(source)["_agent_records"]
+
+        self.assertEqual(
+            {record["activity_state"] for record in records}, {"incomplete"},
+        )
+
+    def test_message_update_improves_usage_without_changing_first_owner(self):
+        self.adapter.compatibility = meter._claude_compatibility()
+        self.nested.write_text("".join((
+            json.dumps(assistant(
+                "shared", claude_usage(input_tokens=30, output_tokens=3),
+                "2026-09-07T00:00:01.000Z",
+            )) + "\n",
+            json.dumps(assistant(
+                "unique", claude_usage(input_tokens=20, output_tokens=2),
+                "2026-09-07T00:00:02.000Z",
+            )) + "\n",
+        )))
+        source = self.adapter.discover_legacy(
+            DiscoveryContext(home=str(self.root)),
+        )[0]
+
+        summary = self.adapter.summarize_legacy(source)
+        root, child = summary["_agent_records"]
+
+        self.assertEqual(root["tokens"], 33)
+        self.assertEqual(child["tokens"], 22)
+        self.assertEqual(summary["tokens"], 55)
+
+    def test_nested_component_hierarchy_uses_opaque_ids_and_distinct_idless_rows(self):
+        self.adapter.compatibility = meter._claude_compatibility()
+        grandchild = (
+            self.nested.with_suffix("") / "subagents" / "agent-two.jsonl"
+        )
+        grandchild.parent.mkdir(parents=True)
+        idless = assistant(
+            None, claude_usage(input_tokens=3, output_tokens=4),
+            "2026-09-07T00:00:03.000Z",
+        )
+        grandchild.write_text(json.dumps(idless) + "\n")
+        source = self.adapter.discover_legacy(
+            DiscoveryContext(home=str(self.root)),
+        )[0]
+
+        summary = self.adapter.summarize_legacy(source)
+        root, child, nested = summary["_agent_records"]
+
+        self.assertEqual(nested["parent_id"], child["id"])
+        self.assertEqual(nested["depth"], 2)
+        self.assertEqual(nested["tokens"], 7)
+        self.assertNotIn("agent-two", nested["id"])
+        self.assertNotIn("subagents", nested["id"])
+        self.assertEqual(summary["tokens"], 40)
+
     def test_copied_and_symlinked_transcripts_merge_by_logical_message_id(self):
         copied = self.main.parent / "copied.jsonl"
         alias = self.main.parent / "alias.jsonl"
@@ -533,6 +724,79 @@ class ClaudeGroupedDiscoveryTests(unittest.TestCase):
         self.assertEqual(trace["executions"][0]["tokens"]["cache_write_1h"], 20)
         self.assertIn("cache_write_5m_tokens", METRICS)
         self.assertIn("cache_write_1h_tokens", METRICS)
+
+
+class ClaudeDiscoveryCacheTests(unittest.TestCase):
+    COUNT = 600
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.projects = self.root / "projects"
+        self.traces = []
+        for index in range(self.COUNT):
+            trace = self.projects / f"-work-project-{index % 50}" / f"session-{index}.jsonl"
+            trace.parent.mkdir(parents=True, exist_ok=True)
+            rows = [{"type": "user", "timestamp": "2026-08-11T00:00:00Z",
+                     "cwd": "/work/project", "message": {"content": "prompt"}}]
+            rows.extend(assistant(
+                f"msg-{index}-{turn}", claude_usage(input_tokens=1, output_tokens=1),
+            ) for turn in range(3))
+            trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            self.traces.append(trace)
+        self.adapter = ClaudeRuntimeAdapter(self.projects, [self.root / "Claude"])
+        self.loads = []
+        original = self.adapter.load_rows
+
+        def counting_load_rows(paths):
+            self.loads.append(tuple(paths))
+            return original(paths)
+
+        self.adapter.load_rows = counting_load_rows
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def discover(self):
+        self.loads.clear()
+        return self.adapter.discover_legacy(DiscoveryContext(home=str(self.root)))
+
+    def test_unchanged_transcripts_are_not_reread_beyond_the_old_cache_limit(self):
+        cold = self.discover()
+        self.assertEqual(len(self.loads), self.COUNT)
+
+        warm = self.discover()
+
+        self.assertEqual(self.loads, [])
+        self.assertEqual(
+            [record["path"] for record in warm], [record["path"] for record in cold],
+        )
+
+    def test_only_a_changed_transcript_is_reread(self):
+        self.discover()
+        changed = self.traces[7]
+        with changed.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(assistant(
+                "msg-new", claude_usage(input_tokens=1, output_tokens=1),
+            )) + "\n")
+
+        self.discover()
+
+        self.assertEqual(self.loads, [(str(changed),)])
+
+    def test_deleted_transcripts_leave_both_caches(self):
+        self.discover()
+        for trace in self.traces:
+            self.adapter.trace_activity(str(trace))
+        self.assertEqual(len(self.adapter._activity_cache), self.COUNT)
+        for trace in self.traces[:100]:
+            trace.unlink()
+
+        self.discover()
+
+        live = {str(trace) for trace in self.traces[100:]}
+        self.assertEqual(len(self.adapter._message_id_cache), self.COUNT - 100)
+        self.assertEqual(set(self.adapter._activity_cache), live)
 
 
 class ClaudeDurationProjectionTests(unittest.TestCase):

@@ -1,6 +1,7 @@
 """Native adapter for Codex JSONL session evidence."""
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,7 @@ from token_meter.contracts import (
     TurnSummary,
     UsageEvidence,
 )
+from token_meter.domain.tools import session_capabilities
 from token_meter.domain.usage import normalize_reported_token_count
 
 
@@ -129,6 +131,16 @@ def _context_model(payload, current_model, source_model):
     if trace_model == AUTO_REVIEW_MODEL:
         return source_model if source_model != AUTO_REVIEW_MODEL else "unknown-model"
     return str(trace_model or current_model or "unknown-model")
+
+
+def _pricing_variant(payload):
+    """Use only explicit service-tier evidence; never infer speed from effort."""
+    tier = payload.get("service_tier")
+    if tier in (None, "auto", "default", "standard"):
+        return ""
+    if tier in ("priority", "fast"):
+        return "fast"
+    return "unsupported"
 
 
 def _resolved_token_events(events, source_model):
@@ -233,6 +245,46 @@ def _compact(value, limit=90):
     return value[:limit - 1] + "…" if len(value) > limit else value
 
 
+def _safe_agent_display(value, limit, *, nickname=False):
+    """Keep short agent identifiers, never arbitrary provider prose."""
+    if not isinstance(value, str):
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return ""
+    text = " ".join(value.split())
+    lowered = text.lower()
+    if not text or len(text) > limit:
+        return ""
+    if (
+        text.startswith(("/", "\\", "~", "./", "../"))
+        or re.match(r"^[A-Za-z]:[\\/]", text)
+        or "://" in text
+        or lowered.startswith(("bearer ", "sk-", "-----begin "))
+        or any(marker in lowered for marker in (
+            "api_key=", "api-key=", "secret=", "token=",
+        ))
+    ):
+        return ""
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", text):
+        return text
+    if nickname and re.fullmatch(
+        r"[A-Z][a-z]{1,31} (?:[A-Z][a-z]{1,31}|[0-9]{1,3})", text,
+    ):
+        return text
+    return ""
+
+
+def _opaque_agent_id(physical_trace_id):
+    """Return a stable public agent ID without exposing provider trace identity."""
+    physical = str(physical_trace_id or "")
+    if not physical:
+        return ""
+    digest = hashlib.sha256(
+        b"token-meter:codex-agent:v1\0" + physical.encode("utf-8", "replace")
+    ).hexdigest()
+    return "codex-agent-" + digest
+
+
 def _catalog(dynamic_tools):
     result = []
     for item in dynamic_tools or []:
@@ -249,6 +301,7 @@ def _catalog(dynamic_tools):
             namespace = str(child.get("namespace") or parent_namespace or "unknown")
             kind = "tool"
             raw_name = name
+            host_provided = False
             if name.startswith("mcp__"):
                 parts = name.split("__")
                 namespace = parts[1] if len(parts) > 1 and parts[1] else "mcp"
@@ -258,17 +311,25 @@ def _catalog(dynamic_tools):
                 namespace = parts[1] if len(parts) > 1 and parts[1] else "mcp"
                 raw_name = "mcp__{}__{}".format(namespace, name)
                 kind = "mcp"
+            elif isinstance(children, list) and namespace not in CODEX_BUILTIN_NAMESPACES:
+                # Codex calls its grouped app tools as mcp__<namespace>__<tool>.
+                raw_name = "mcp__{}__{}".format(namespace, name)
+                kind = "mcp"
+                host_provided = True
             definition = {
                 "description": child.get("description") or "",
                 "inputSchema": child.get("inputSchema") or child.get("input_schema") or {},
             }
-            result.append({
+            entry = {
                 "namespace": namespace,
                 "name": raw_name,
                 "kind": kind,
                 "defer_loading": bool(child.get("deferLoading", parent_deferred)),
                 "definition_tokens": len(json.dumps(definition, sort_keys=True)) // 4,
-            })
+            }
+            if host_provided:
+                entry["host_provided"] = True
+            result.append(entry)
     return result[:240]
 
 
@@ -276,6 +337,73 @@ def _catalog_counts(catalog):
     advertised = len(catalog or ())
     deferred = sum(1 for row in catalog or () if row.get("defer_loading"))
     return advertised, max(0, advertised - deferred), deferred
+
+
+CODEX_BUILTIN_NAMESPACES = frozenset({
+    "", "collaboration", "clock", "web", "multi_agent_v1", "image_gen", "functions",
+})
+_CODEX_NESTED_CALL_RE = re.compile(r"\btools\.([A-Za-z0-9_\-]+?)__([A-Za-z0-9_\-]+)\s*\(")
+
+
+# Grouped dynamic tools the Codex app provides itself; not user-configurable MCP servers.
+CODEX_HOST_TOOL_GROUPS = frozenset({"codex_app", "plugin_management", "chrome_extension"})
+
+
+def codex_mcp_tool_name(name, namespace):
+    """Return one identity for app/MCP tools Codex labels as `S` or `mcp__S`."""
+    namespace = str(namespace or "")
+    if not name or str(name).startswith("mcp__"):
+        return name
+    if namespace.startswith("mcp__"):
+        server = namespace.split("__")[1]
+    elif "__" not in namespace:
+        server = namespace
+    else:
+        server = ""
+    if server and server not in CODEX_BUILTIN_NAMESPACES:
+        return "mcp__{}__{}".format(server, name)
+    return name
+
+
+def codex_host_provided(name):
+    parts = str(name or "").split("__")
+    return len(parts) > 2 and parts[0] == "mcp" and parts[1] in CODEX_HOST_TOOL_GROUPS
+
+
+def codex_nested_tool_names(code):
+    """Return MCP/app tool calls made inside a code-mode `exec` block."""
+    names = []
+    for match in _CODEX_NESTED_CALL_RE.finditer(str(code or "")):
+        prefix, leaf = match.group(1), match.group(2)
+        if prefix == "mcp":
+            server, _, tool = leaf.partition("__")
+            if server and tool:
+                names.append("mcp__{}__{}".format(server, tool))
+        elif prefix not in CODEX_BUILTIN_NAMESPACES:
+            names.append("mcp__{}__{}".format(prefix, leaf))
+    return names
+
+
+def _loaded_skill_names(objs, skill_names_from_value):
+    """Return skill names Codex advertised to the session; None when unrecorded."""
+    names = None
+    for obj in objs or ():
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        texts = []
+        if obj.get("type") == "world_state":
+            state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+            host = state.get("host_skills") if isinstance(state.get("host_skills"), dict) else {}
+            if isinstance(host.get("body"), str):
+                texts.append(host["body"])
+        elif payload.get("type") == "message" and payload.get("role") == "developer":
+            for block in payload.get("content") or ():
+                text = block.get("text") if isinstance(block, dict) else None
+                if isinstance(text, str) and "<skills_instructions>" in text:
+                    texts.append(text.split("<skills_instructions>", 1)[1].split("</skills_instructions>", 1)[0])
+        for text in texts:
+            names = names if names is not None else set()
+            names.update(skill_names_from_value(text))
+    return names
 
 
 class CodexRuntimeAdapter:
@@ -311,6 +439,7 @@ class CodexRuntimeAdapter:
         self._index_rows = {}
         self._records_by_path = {}
         self._record_by_physical_id = {}
+        self._agent_record_by_physical_id = {}
 
     def _paths(self):
         pattern = str(self.sessions_root / "*" / "*" / "*" / "*.jsonl")
@@ -363,6 +492,38 @@ class CodexRuntimeAdapter:
         )
         return payload.get("parent_thread_id") or spawn.get("parent_thread_id")
 
+    @staticmethod
+    def _agent_metadata(payload):
+        """Keep only documented, content-free relationship metadata."""
+        source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+        subagent = source.get("subagent") if isinstance(source.get("subagent"), dict) else {}
+        spawn = (
+            subagent.get("thread_spawn")
+            if isinstance(subagent.get("thread_spawn"), dict)
+            else {}
+        )
+        direct_parent = str(payload.get("parent_thread_id") or "").strip()
+        spawn_parent = str(spawn.get("parent_thread_id") or "").strip()
+        raw_depth = spawn.get("depth")
+        depth = None
+        if not isinstance(raw_depth, bool):
+            try:
+                parsed_depth = int(raw_depth)
+                depth = parsed_depth if 0 <= parsed_depth <= 64 else None
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return {
+            "agent_kind": (
+                "spawned" if spawn else "internal" if direct_parent else "root"
+            ),
+            "agent_parent_physical_id": direct_parent or spawn_parent or None,
+            "agent_depth": depth,
+            "agent_label": _safe_agent_display(
+                spawn.get("agent_nickname"), 80, nickname=True,
+            ),
+            "agent_role": _safe_agent_display(spawn.get("agent_role"), 64),
+        }
+
     def metadata(self, path):
         path = os.path.abspath(os.path.expanduser(str(path)))
         try:
@@ -389,6 +550,11 @@ class CodexRuntimeAdapter:
             "forked_from_id": None,
             "parent_thread_id": None,
             "lineage_parent_id": None,
+            "agent_kind": "root",
+            "agent_parent_physical_id": None,
+            "agent_depth": None,
+            "agent_label": "",
+            "agent_role": "",
             "cwd": None,
             "model": None,
             "model_provider": None,
@@ -423,6 +589,7 @@ class CodexRuntimeAdapter:
                             logical = str(payload.get("session_id") or physical)
                             forked = str(payload.get("forked_from_id") or "") or None
                             parent = str(self._parent_thread_id(payload) or "") or None
+                            agent_metadata = self._agent_metadata(payload)
                             metadata.update({
                                 "session_id": logical,
                                 "physical_trace_id": physical,
@@ -430,6 +597,7 @@ class CodexRuntimeAdapter:
                                 "forked_from_id": forked,
                                 "parent_thread_id": parent,
                                 "lineage_parent_id": forked or parent,
+                                **agent_metadata,
                             })
                             identity_seen = True
                         metadata["cwd"] = payload.get("cwd") or metadata["cwd"]
@@ -492,6 +660,17 @@ class CodexRuntimeAdapter:
                 "forked_from_id": metadata.get("forked_from_id"),
                 "parent_thread_id": metadata.get("parent_thread_id"),
                 "lineage_parent_id": metadata.get("lineage_parent_id"),
+                "agent_kind": metadata.get("agent_kind") or "root",
+                "agent_parent_physical_id": metadata.get(
+                    "agent_parent_physical_id"
+                ),
+                "agent_parent_session_id": None,
+                "agent_id": _opaque_agent_id(physical_id),
+                "agent_parent_id": None,
+                "agent_session_id": None,
+                "agent_depth": metadata.get("agent_depth"),
+                "agent_label": metadata.get("agent_label") or "",
+                "agent_role": metadata.get("agent_role") or "",
                 "path": path,
                 "project": self.project_resolver(cwd),
                 "mtime": os.path.getmtime(path) if os.path.exists(path) else 0.0,
@@ -520,7 +699,53 @@ class CodexRuntimeAdapter:
             for physical_id, matches in records_by_physical_id.items()
             if len(matches) == 1
         }
+        self._agent_record_by_physical_id = {}
+        for physical_id, matches in records_by_physical_id.items():
+            identities = {
+                (
+                    str(match.get("logical_session_id") or ""),
+                    str(match.get("agent_parent_physical_id") or ""),
+                    str(match.get("agent_kind") or "root"),
+                    str(match.get("project") or ""),
+                    match.get("agent_depth"),
+                    str(match.get("agent_label") or ""),
+                    str(match.get("agent_role") or ""),
+                )
+                for match in matches
+            }
+            if len(identities) != 1:
+                continue
+            self._agent_record_by_physical_id[physical_id] = min(
+                matches,
+                key=lambda match: (
+                    not bool(match.get("_aggregation_canonical")),
+                    -float(match.get("mtime") or 0),
+                    -float(match.get("signature_mtime") or 0),
+                    str(match.get("path") or ""),
+                ),
+            )
         self._records_by_path = {record["path"]: record for record in records}
+        physical_ids_by_session = defaultdict(set)
+        for record in records:
+            physical_ids_by_session[record["id"]].add(
+                record["physical_trace_id"]
+            )
+        for record in records:
+            parent = self._agent_record_by_physical_id.get(
+                record.get("agent_parent_physical_id")
+            )
+            if (
+                parent
+                and parent.get("physical_trace_id") != record.get("physical_trace_id")
+                and not self._has_agent_cycle(record)
+            ):
+                record["agent_parent_id"] = parent.get("agent_id")
+                if parent.get("id") != record.get("id"):
+                    record["agent_parent_session_id"] = parent.get("id")
+            if record.get("agent_kind") == "root" or len(
+                physical_ids_by_session[record["id"]]
+            ) == 1:
+                record["agent_session_id"] = record["id"]
         for record in records:
             if record.get("observed_model") == AUTO_REVIEW_MODEL:
                 if self._has_auto_review_identity_cycle(record):
@@ -595,6 +820,14 @@ class CodexRuntimeAdapter:
             "parent_thread_id": record["parent_thread_id"],
             "lineage_parent_id": record["lineage_parent_id"],
             "lineage_revision": record["lineage_revision"],
+            "agent_kind": record["agent_kind"],
+            "agent_parent_session_id": record["agent_parent_session_id"],
+            "agent_id": record["agent_id"],
+            "agent_parent_id": record["agent_parent_id"],
+            "agent_session_id": record["agent_session_id"],
+            "agent_depth": record["agent_depth"],
+            "agent_label": record["agent_label"],
+            "agent_role": record["agent_role"],
             "session": os.path.basename(record["path"]),
             "path": record["path"],
             "project": record["project"],
@@ -705,6 +938,21 @@ class CodexRuntimeAdapter:
             if not parent_id:
                 return False
             current = self._record_by_physical_id.get(parent_id)
+        return False
+
+    def _has_agent_cycle(self, record):
+        """Reject cycles in explicit agent parentage independently of forks."""
+        seen = set()
+        current = record
+        while current:
+            physical_id = current.get("physical_trace_id")
+            if not physical_id or physical_id in seen:
+                return True
+            seen.add(physical_id)
+            parent_id = current.get("agent_parent_physical_id")
+            if not parent_id:
+                return False
+            current = self._agent_record_by_physical_id.get(parent_id)
         return False
 
     def _has_auto_review_identity_cycle(self, record):
@@ -965,6 +1213,7 @@ class CodexRuntimeAdapter:
         build_state = compat["build_state"]
         catalog_counts = compat["catalog_counts"]
         codex_approval_policy_label = compat["codex_approval_policy_label"]
+        codex_fallback_user_text = compat["codex_fallback_user_text"]
         codex_live_performance_summary = compat["codex_live_performance_summary"]
         codex_performance_samples = compat["codex_performance_samples"]
         codex_wait_samples = compat["codex_wait_samples"]
@@ -994,6 +1243,7 @@ class CodexRuntimeAdapter:
         objs = self._accounting_rows(source, objs)
     
         model = source.get("model") or "unknown-model"
+        pricing_variant = ""
         meta_cwd = source.get("project")
         tot = {"input": 0, "cache_write": 0, "cache_read": 0, "output": 0}
         cost = {"input": 0.0, "cache_write": 0.0, "cache_read": 0.0, "output": 0.0}
@@ -1035,6 +1285,7 @@ class CodexRuntimeAdapter:
                 continue
             if otype == "turn_context":
                 model = _context_model(payload, model, source.get("model"))
+                pricing_variant = _pricing_variant(payload)
                 meta_cwd = home_shorten(payload.get("cwd") or meta_cwd)
                 detail = " · ".join(x for x in [
                     model,
@@ -1117,8 +1368,10 @@ class CodexRuntimeAdapter:
                         native_type="response_item", native_subtype="agent_message",
                     ))
                 elif role == "user":
-                    txt = compact_text(text_from_content(content), 84)
+                    user_text = codex_fallback_user_text(payload)
+                    txt = compact_text(user_text or "", 84)
                     if txt:
+                        pending["fallback_user_inputs"].append(compact_text(user_text, 220))
                         pending["trace"].append(trace_event(
                             ts, "user", "User message", txt, severity="start", model=model,
                             native_type="response_item", native_subtype="user_message",
@@ -1127,6 +1380,7 @@ class CodexRuntimeAdapter:
     
             if ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
                 name = payload.get("name") or ("web.search" if ptype == "web_search_call" else ptype.replace("_call", ""))
+                name = codex_mcp_tool_name(name, payload.get("namespace"))
                 call_id = payload.get("call_id") or payload.get("id") or f"call-{len(call_map) + 1}"
                 ident = tool_identity(name)
                 arguments = payload.get("arguments") or payload.get("input")
@@ -1209,13 +1463,14 @@ class CodexRuntimeAdapter:
                 input_complete = input_complete and usage["input_available"]
                 output_complete = output_complete and usage["output_available"]
                 idx = len(series) + 1
-                _, missing_price = price_for(model, "codex", at=ts)
+                event_variant = _pricing_variant(payload) if "service_tier" in payload else pricing_variant
+                _, missing_price = price_for(model, "codex", event_variant, at=ts)
                 cost_available = (
                     not missing_price
                     and usage["input_available"]
                     and usage["output_available"]
                 )
-                c = cost_of(usage, model, "codex", at=ts) if cost_available else {
+                c = cost_of(usage, model, "codex", event_variant, at=ts) if cost_available else {
                     "input": 0.0, "cache_write": 0.0,
                     "cache_read": 0.0, "output": 0.0,
                 }
@@ -1243,7 +1498,9 @@ class CodexRuntimeAdapter:
                 last_ts = ts if ts else last_ts
     
                 tools = [dict(t) for t in pending["calls"].values()]
-                user_input = user_prompt_preview(pending.get("user_inputs") or [])
+                user_input = user_prompt_preview(
+                    pending.get("user_inputs") or pending.get("fallback_user_inputs") or []
+                )
                 observed_tools_loaded = tools_loaded or len(set(t.get("name") for t in call_map.values() if t.get("name")))
                 for ev in pending["trace"]:
                     ev["execution"] = idx if ev.get("execution") is None else ev["execution"]
@@ -1286,6 +1543,7 @@ class CodexRuntimeAdapter:
                     "ts": ts or 0,
                     "time": time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "",
                     "model": model,
+                    "pricing_variant": event_variant,
                     "tokens": {"input": in_tok, "output": out_tok, "reasoning": reasoning,
                                "retrieval": sum(t["output_tokens"] for t in tools),
                                "fresh_input": fresh_input_tokens, "cache": cache_tokens,
@@ -1350,6 +1608,7 @@ class CodexRuntimeAdapter:
         source["tools_deferred"] = tools_deferred
         source["tool_catalog"] = tool_catalog
         source["tool_namespaces"] = tool_namespaces
+        source["_loaded_skills"] = _loaded_skill_names(objs, skill_names_from_value)
         wait_samples = codex_wait_samples(objs, source.get("model"))
         state = build_state(source, tot, cost, total_tokens, total_cost, series, executions, trace, semantic,
                             analyses, insights, first_ts, last_ts, idle, biggest, len(coord_execs), True,
@@ -1373,8 +1632,6 @@ class CodexRuntimeAdapter:
         CURRENT_SESSION_CONTEXT_SAMPLES = compat["context_sample_limit"]
         add_model_daily = compat["add_model_daily"]
         add_model_summary = compat["add_model_summary"]
-        analyze_language_signals = compat["analyze_language_signals"]
-        attach_language_signals = compat["attach_language_signals"]
         codex_live_performance_summary = compat["codex_live_performance_summary"]
         codex_performance_samples = compat["codex_performance_samples"]
         codex_tool_call_evidence = compat["codex_tool_call_evidence"]
@@ -1390,6 +1647,7 @@ class CodexRuntimeAdapter:
         usage_tokens = compat["usage_tokens"]
         model = source.get("model") or "unknown-model"
         reasoning_effort = ""
+        pricing_variant = ""
         cost = 0.0
         tokens = 0
         turns = 0
@@ -1413,6 +1671,7 @@ class CodexRuntimeAdapter:
             payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
             if obj.get("type") == "turn_context":
                 model = _context_model(payload, model, source.get("model"))
+                pricing_variant = _pricing_variant(payload)
                 effort = payload.get("effort")
                 if isinstance(effort, (str, int, float)) and str(effort).strip():
                     reasoning_effort = compact_text(str(effort).strip().lower(), 20)
@@ -1434,13 +1693,14 @@ class CodexRuntimeAdapter:
             latest_context = int(usage.get("input_tokens") or 0) + int(usage.get("cache_read_input_tokens") or 0)
             context_samples.append(latest_context)
             ts = parse_iso(obj.get("timestamp", ""))
-            _, missing_price = price_for(model, "codex", at=ts)
+            event_variant = _pricing_variant(payload) if "service_tier" in payload else pricing_variant
+            _, missing_price = price_for(model, "codex", event_variant, at=ts)
             cost_available = (
                 not missing_price
                 and usage["input_available"]
                 and usage["output_available"]
             )
-            c = sum(cost_of(usage, model, "codex", at=ts).values()) \
+            c = sum(cost_of(usage, model, "codex", event_variant, at=ts).values()) \
                 if cost_available else 0.0
             price_complete = price_complete and cost_available
             toks = usage_tokens(usage)
@@ -1507,11 +1767,70 @@ class CodexRuntimeAdapter:
         row["_context_samples"] = context_samples[-CURRENT_SESSION_CONTEXT_SAMPLES:]
         row["terminal"] = terminal
         row["live_throughput"] = codex_live_performance_summary(objs)
-        signal_rollups, signal_events = analyze_language_signals(
-            "codex", objs, default_model=source.get("model") or "unknown-model"
-        )
-        attach_language_signals(row, signal_rollups, signal_events)
         row["_tool_evidence"] = summarize_tool_evidence(codex_tool_call_evidence(objs), source.get("tool_catalog") or [])
+        row["capabilities"] = session_capabilities(
+            row["_tool_evidence"],
+            _loaded_skill_names(objs, compat["skill_names_from_value"]),
+        )
+        model_rows = row.get("model_stats") or []
+        cache_read_tokens = sum(
+            int(item.get("cache_read_tokens") or 0) for item in model_rows
+        )
+        cache_write_tokens = sum(
+            int(item.get("cache_write_tokens") or 0) for item in model_rows
+        )
+        reasoning_tokens = sum(
+            int(item.get("reasoning_tokens") or 0) for item in model_rows
+        )
+        tool_calls = sum(
+            1 for obj in objs
+            if isinstance(obj.get("payload"), dict)
+            and obj["payload"].get("type") in (
+                "function_call", "custom_tool_call", "web_search_call",
+                "tool_search_call",
+            )
+        )
+        activity_state = (
+            "complete" if terminal
+            else "working" if time.time() - float(source.get("mtime") or 0) <= 90
+            else "incomplete"
+        )
+        row["_agent_records"] = [{
+            "id": source.get("agent_id") or _opaque_agent_id(
+                source.get("physical_trace_id")
+            ),
+            "parent_id": source.get("agent_parent_id"),
+            "session_id": source.get("agent_session_id"),
+            "runtime": "codex",
+            "client": "Codex",
+            "kind": source.get("agent_kind") or "root",
+            "depth": source.get("agent_depth"),
+            "label": source.get("agent_label") or "",
+            "role": source.get("agent_role") or None,
+            "model": model,
+            "started_at": first_ts,
+            "ended_at": last_ts if terminal else None,
+            "last_activity_at": last_ts or source.get("mtime"),
+            "activity_state": activity_state,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "tokens": tokens,
+            "tokens_available": bool(row["availability"].get("tokens")),
+            "cost": cost,
+            "cost_available": bool(row["availability"].get("cost")),
+            "executions": turns,
+            "attempts": turns,
+            "retries": 0,
+            "failed_attempts": 0,
+            "tool_calls": tool_calls,
+            "work_time_s": (
+                sum(float(sample.get("duration_s") or 0) for sample in wait_samples)
+                if wait_samples else None
+            ),
+        }]
         return row
 
     def deletion_plan(self, source):

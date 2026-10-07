@@ -76,14 +76,28 @@ from token_meter.domain.aggregates import (
     daily_summaries as _domain_daily_summaries,
     global_tool_waste as _domain_global_tool_waste,
     metric_coverage as _domain_metric_coverage,
+    session_model_reasoning_efforts as _domain_session_model_reasoning_efforts,
     monthly_summaries as _domain_monthly_summaries,
-    rollup_language_signal_events as _domain_rollup_language_signal_events,
     spend_log_summaries as _domain_spend_log_summaries,
     spend_projection as _domain_spend_projection,
+)
+from token_meter.domain.agents import (
+    aggregate_agent_usage as _domain_aggregate_agent_usage,
+    build_agent_graph as _domain_build_agent_graph,
+    build_agent_groups as _domain_build_agent_groups,
+    find_agent_group as _domain_find_agent_group,
 )
 from token_meter.domain.builder_recap import (
     VALID_RECAP_RANGES,
     build_builder_recap as _domain_build_builder_recap,
+)
+from token_meter.domain.compare import (
+    compare_entry as _compare_entry,
+    compare_sessions as _compare_sessions,
+    matching_sessions as _compare_matching_sessions,
+    normalize_compare_ids,
+    trace_key as _compare_trace_key,
+    trace_stem as _compare_trace_stem,
 )
 from token_meter.domain.insights import (
     build_cost_insights as _domain_build_cost_insights,
@@ -104,10 +118,13 @@ from token_meter.domain.tools import (
     capability_control_groups as _domain_capability_control_groups,
     optional_capability_summary as _domain_optional_capability_summary,
     summarize_tool_evidence as _domain_summarize_tool_evidence,
+    session_capabilities as _domain_session_capabilities,
     tool_identity as _domain_tool_identity,
     tool_summary as _domain_tool_summary,
 )
-from token_meter.services.git_delivery import GitDeliveryLedger, GitDeliveryService
+from token_meter.services.git_delivery import (
+    GitDeliveryLedger, GitDeliveryService, MAX_QUERY_PROJECTS, MAX_REPOSITORIES,
+)
 from token_meter.models.catalog import (
     ANTHROPIC_PRICE as CLAUDE_PRICE,
     BUILTIN_MODEL_PRICE_HISTORY as _CANONICAL_BUILTIN_MODEL_PRICE_HISTORY,
@@ -136,6 +153,10 @@ from token_meter.models.pricing import (
 )
 from token_meter.platforms.base import ProcessPurpose
 from token_meter.platforms.registry import platform_services
+from token_meter.projections import (
+    agent_group_projection as _agent_group_projection,
+    agent_usage_projection as _agent_usage_projection,
+)
 from token_meter.quotas.base import CallableQuotaAdapter, QuotaUnavailable
 from token_meter.quotas import anthropic as anthropic_quotas
 from token_meter.quotas.common import (
@@ -153,13 +174,22 @@ from token_meter.quotas import cursor as cursor_quotas
 from token_meter.quotas import openai as openai_quotas
 from token_meter.quotas.registry import QuotaRegistry
 from token_meter.runtimes.cursor import (
+    CURSOR_TOOL_ALIASES,
+    CURSOR_TOOL_IDENTITIES,
     CursorRuntimeAdapter,
     CursorRuntimeAdapterProxy,
+    cursor_agent_id,
+    cursor_model_name,
+    cursor_tool_identity,
 )
 from token_meter.runtimes.codex import (
     AUTO_REVIEW_MODEL,
     CodexRuntimeAdapter,
     CodexRuntimeAdapterProxy,
+    CODEX_BUILTIN_NAMESPACES,
+    codex_host_provided,
+    codex_mcp_tool_name,
+    codex_nested_tool_names,
 )
 from token_meter.runtimes.claude import (
     ClaudeRuntimeAdapter,
@@ -274,18 +304,14 @@ TOKEN_METER_UPDATE_STATUS = os.path.expanduser(
 TOKEN_METER_GIT_DELIVERY_DB = os.path.expanduser(
     os.environ.get("TOKEN_METER_GIT_DELIVERY_DB", "~/.token-meter/git-delivery.sqlite3")
 )
+TOKEN_METER_MATCHED_PACE_CACHE = os.path.expanduser(
+    os.environ.get(
+        "TOKEN_METER_MATCHED_PACE_CACHE",
+        "~/.token-meter/matched-pace-cache.json",
+    )
+)
 PORT = 8722
 
-DEFAULT_FRUSTRATION_TERMS = [
-    "fuck", "fck", "fucked", "fucking", "shit", "shitty", "bullshit",
-    "idiot", "stupid", "useless", "crap", "damn", "wtf",
-]
-DEFAULT_POSITIVE_TERMS = [
-    "thank you", "thanks", "perfect", "great",
-    "exactly what i needed", "works now", "love it",
-]
-MAX_FRUSTRATION_TERMS = 64
-MAX_FRUSTRATION_TERM_LENGTH = 40
 MODEL_PRICE_PROVIDERS = ("claude", "codex", "cursor", "opencode")
 MAX_CUSTOM_MODEL_PRICES = 100
 MAX_MODEL_PRICE_PERIODS = 256
@@ -305,6 +331,7 @@ DEFAULT_BUDGET_THRESHOLDS = (80, 90, 100)
 DEFAULT_SESSION_BUDGET = 10.0
 MIN_SESSION_BUDGET = 0.5
 MAX_MONTHLY_BUDGET = 100_000_000.0
+MAX_SESSION_BUDGETS = 500
 OPENCODE_DETAIL_MESSAGE_LIMIT = 200
 UPDATE_CHECK_INTERVAL_S = 10 * 60
 GIT_DELIVERY_INTERVAL_S = 5 * 60
@@ -348,13 +375,18 @@ _SOURCE_INVENTORY = {
     "count": None,
     "clients": {},
     "updated_at": None,
+    "revision": 0,
+    "git_delivery_source_signature": "",
+    "git_delivery_candidates": (),
+    "git_delivery_candidates_revision": None,
 }
+_source_inventory_lock = threading.Lock()
 _git_delivery_service_instance = None
 _git_delivery_service_lock = threading.Lock()
 _git_delivery_wake = threading.Event()
 _xsess = {
     "data": None, "at": 0.0, "sessions": [],
-    "internal_rows": (), "project_model_stats": {},
+    "internal_rows": (), "agent_groups": (), "project_model_stats": {},
 }
 _XSESS_TTL = 15.0
 _XSESS_LIVE_REFRESH_S = _XSESS_TTL
@@ -373,6 +405,24 @@ _summary_cache = {}
 _summary_cache_lock = threading.Lock()
 _matched_pace_cache = {"signature": None, "data": None}
 _matched_pace_cache_lock = threading.Lock()
+# One entry per model-runtime pair for the global (all-session) scope, so a
+# changed model only rebuilds the pairs it participates in. Reused across
+# restarts via TOKEN_METER_MATCHED_PACE_CACHE. Loaded, read, mutated, and saved
+# only by the thread holding the single-flight build flag below; it is never
+# touched by project-scoped builds.
+_matched_pace_pair_cache = {}
+_matched_pace_pair_cache_loaded = False
+# Single-flight guard: one rebuild at a time, so concurrent requests share one
+# computation instead of each starting its own.
+_matched_pace_build_condition = threading.Condition(threading.Lock())
+_matched_pace_build_state = {"building": False}
+# Persistence is opt-in so importing the module (tests, tools) never writes the
+# user's cache file. The server entrypoint turns it on.
+_matched_pace_persist = False
+# Bump whenever the matching algorithm, thresholds, result fields, or pair-key
+# format change, so stale persisted comparisons are discarded on load.
+MATCHED_PACE_CACHE_SCHEMA = 2
+MATCHED_PACE_CACHE_MAX_PAIRS = 4000
 _SKILL_CATALOG_TTL_S = 60.0
 _skill_catalog_cache = {"rows": None, "at": 0.0}
 _skill_catalog_cache_lock = threading.Lock()
@@ -599,151 +649,39 @@ def load_json(path, default=None):
         return {} if default is None else default
 
 
+OBSOLETE_SETTINGS_KEYS = ("language_signal_terms", "frustration_terms")
+
+
+def write_settings_json(path, settings):
+    """Atomically write machine-wide settings, dropping keys for removed features."""
+    for key in OBSOLETE_SETTINGS_KEYS:
+        settings.pop(key, None)
+    atomic_write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+
+
 def atomic_write_text(path, text):
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    tmp = os.path.join(directory, f".{os.path.basename(path)}.token-meter-{os.getpid()}")
+    tmp = os.path.join(
+        directory,
+        f".{os.path.basename(path)}.token-meter-{os.getpid()}-{secrets.token_hex(8)}",
+    )
     mode = None
     try:
         mode = os.stat(path).st_mode & 0o777
     except OSError:
         pass
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
-
-
-def normalize_language_signal_terms(values, group="language signal"):
-    """Normalize one user-editable lexical group while preserving display order."""
-    if isinstance(values, str):
-        values = re.split(r"[,\n]", values)
-    if not isinstance(values, list):
-        raise ValueError(f"{group.title()} terms must be a list or comma-separated text.")
-    normalized = []
-    seen = set()
-    for value in values:
-        term = " ".join(str(value or "").strip().lower().split())
-        if not term:
-            continue
-        if len(term) > MAX_FRUSTRATION_TERM_LENGTH:
-            raise ValueError(
-                f"Each {group} term must be {MAX_FRUSTRATION_TERM_LENGTH} characters or fewer."
-            )
-        if any(ord(char) < 32 for char in term):
-            raise ValueError(f"{group.title()} terms cannot contain control characters.")
-        if term not in seen:
-            normalized.append(term)
-            seen.add(term)
-    if len(normalized) > MAX_FRUSTRATION_TERMS:
-        raise ValueError(f"Use at most {MAX_FRUSTRATION_TERMS} {group} terms.")
-    return normalized
-
-
-def normalize_frustration_terms(values):
-    """Backward-compatible Friction-group normalizer."""
-    return normalize_language_signal_terms(values, "friction")
-
-
-def language_signal_settings(path=None):
-    path = path or TOKEN_METER_SETTINGS
-    settings = load_json(path, {})
-    if not isinstance(settings, dict):
-        settings = {}
-
-    raw = settings.get("language_signal_terms")
-    defaults = {
-        "positive": list(DEFAULT_POSITIVE_TERMS),
-        "friction": list(DEFAULT_FRUSTRATION_TERMS),
-    }
-    groups = {}
-    for group in ("positive", "friction"):
-        values = raw.get(group) if isinstance(raw, dict) and group in raw else None
-        if values is None and group == "friction" and "frustration_terms" in settings:
-            values = settings.get("frustration_terms")
-        try:
-            groups[group] = (
-                normalize_language_signal_terms(values, group)
-                if values is not None else list(defaults[group])
-            )
-        except ValueError:
-            groups[group] = list(defaults[group])
-    return {
-        **groups,
-        "defaults": defaults,
-        "max_terms": MAX_FRUSTRATION_TERMS,
-        "method": (
-            "case-insensitive whole-phrase match; quoted or discussed phrases can match; "
-            "not sentiment analysis"
-        ),
-    }
-
-
-def set_language_signal_terms(values, path=None):
-    """Persist both machine-wide lexical signal groups atomically."""
-    path = path or TOKEN_METER_SETTINGS
-    if not isinstance(values, dict):
-        return {"ok": False, "error": "Language signal terms must be an object."}
-    current = language_signal_settings(path)
     try:
-        groups = {
-            group: normalize_language_signal_terms(
-                values.get(group, current[group]), group
-            )
-            for group in ("positive", "friction")
-        }
-    except ValueError as error:
-        return {"ok": False, "error": str(error)}
-    settings = load_json(path, {})
-    if not isinstance(settings, dict):
-        settings = {}
-    changed = (
-        settings.get("language_signal_terms") != groups
-        or "frustration_terms" in settings
-    )
-    settings["language_signal_terms"] = groups
-    settings.pop("frustration_terms", None)
-    try:
-        atomic_write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-    except OSError as error:
-        return {"ok": False, "error": f"Token Meter could not save settings: {error}"}
-    return {
-        "ok": True,
-        "changed": changed,
-        **groups,
-        "defaults": {
-            "positive": list(DEFAULT_POSITIVE_TERMS),
-            "friction": list(DEFAULT_FRUSTRATION_TERMS),
-        },
-        "max_terms": MAX_FRUSTRATION_TERMS,
-    }
-
-
-def frustration_settings(path=None):
-    """Return the Friction group through the legacy settings contract."""
-    settings = language_signal_settings(path)
-    return {
-        "terms": list(settings["friction"]),
-        "defaults": list(settings["defaults"]["friction"]),
-        "max_terms": settings["max_terms"],
-    }
-
-
-def set_frustration_terms(values, path=None):
-    """Persist the Friction group through the legacy settings contract."""
-    result = set_language_signal_terms({"friction": values}, path)
-    if not result.get("ok"):
-        return result
-    return {
-        "ok": True,
-        "changed": result.get("changed", False),
-        "terms": list(result["friction"]),
-        "defaults": list(result["defaults"]["friction"]),
-        "max_terms": result["max_terms"],
-    }
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
 
 
 def normalize_model_price_provider(provider):
@@ -1175,7 +1113,7 @@ def set_model_prices(changes, path=None, apply_to_all_history=False,
     else:
         settings.pop("model_pricing", None)
     try:
-        atomic_write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        write_settings_json(path, settings)
     except OSError:
         return {"ok": False, "error": "Token Meter could not save settings."}
 
@@ -1713,6 +1651,20 @@ def set_session_model_identity(session_key, model=None, provider="codex", remove
     }
 
 
+def normalize_session_budget_value(value, label="Session budget"):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a number.")
+    value = float(value)
+    if (not math.isfinite(value)
+            or value < MIN_SESSION_BUDGET
+            or value > MAX_MONTHLY_BUDGET):
+        raise ValueError(
+            f"{label} must be between "
+            f"{MIN_SESSION_BUDGET:g} and {MAX_MONTHLY_BUDGET:,.0f}."
+        )
+    return value
+
+
 def normalize_budget_settings(values):
     """Validate one machine-wide monthly budget configuration."""
     if values is None:
@@ -1726,17 +1678,23 @@ def normalize_budget_settings(values):
     default_session_budget = values.get(
         "default_session_budget", DEFAULT_SESSION_BUDGET,
     )
-    if (isinstance(default_session_budget, bool)
-            or not isinstance(default_session_budget, (int, float))):
-        raise ValueError("Default session budget must be a number.")
-    default_session_budget = float(default_session_budget)
-    if (not math.isfinite(default_session_budget)
-            or default_session_budget < MIN_SESSION_BUDGET
-            or default_session_budget > MAX_MONTHLY_BUDGET):
-        raise ValueError(
-            "Default session budget must be between "
-            f"{MIN_SESSION_BUDGET:g} and {MAX_MONTHLY_BUDGET:,.0f}."
-        )
+    default_session_budget = normalize_session_budget_value(
+        default_session_budget, "Default session budget",
+    )
+
+    raw_session_budgets = values.get("session_budgets") or {}
+    if not isinstance(raw_session_budgets, dict):
+        raise ValueError("Session budgets must be an object.")
+    if len(raw_session_budgets) > MAX_SESSION_BUDGETS:
+        raise ValueError(f"Token Meter supports at most {MAX_SESSION_BUDGETS} saved session budgets.")
+    session_budgets = {}
+    for raw_session_id, raw_budget in raw_session_budgets.items():
+        if not isinstance(raw_session_id, str):
+            raise ValueError("Session budget IDs must be strings.")
+        session_id = raw_session_id.strip()
+        if not session_id or len(session_id) > 240:
+            raise ValueError("Session budget IDs must be 1 to 240 characters.")
+        session_budgets[session_id] = normalize_session_budget_value(raw_budget)
 
     raw_allocations = values.get("allocations") or {}
     if not isinstance(raw_allocations, dict):
@@ -1783,6 +1741,7 @@ def normalize_budget_settings(values):
     return {
         "currency": "USD",
         "default_session_budget": default_session_budget,
+        "session_budgets": session_budgets,
         "monthly_total": total,
         "allocations": allocations,
         "thresholds": thresholds,
@@ -1801,23 +1760,142 @@ def budget_settings(path=None):
         return normalize_budget_settings({})
 
 
+_budget_settings_locks = {}
+_budget_settings_locks_guard = threading.Lock()
+
+
+def _budget_settings_lock(path):
+    """Serialize each machine settings file across dashboard and MCP processes."""
+    path = os.path.abspath(path)
+    with _budget_settings_locks_guard:
+        lock = _budget_settings_locks.setdefault(path, threading.RLock())
+
+    @contextlib.contextmanager
+    def hold():
+        with lock:
+            lock_path = f"{path}.budget-lock"
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(lock_path, "a+", encoding="utf-8") as fh:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        fh.seek(0)
+                        if not fh.read(1):
+                            fh.seek(0)
+                            fh.write("0")
+                            fh.flush()
+                        fh.seek(0)
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                    yield
+                finally:
+                    if os.name == "nt":
+                        fh.seek(0)
+                        with contextlib.suppress(OSError):
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        with contextlib.suppress(OSError):
+                            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    return hold()
+
+
+def _update_budget_settings(update, path):
+    """Run one validated budget update as a single locked read/modify/write."""
+    try:
+        with _budget_settings_lock(path):
+            settings = load_json(path, {})
+            if not isinstance(settings, dict):
+                settings = {}
+            current = normalize_budget_settings(settings.get("budgets"))
+            normalized = normalize_budget_settings(update(current))
+            changed = settings.get("budgets") != normalized
+            settings["budgets"] = normalized
+            write_settings_json(path, settings)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+    except OSError as error:
+        return {"ok": False, "error": f"Token Meter could not save settings: {error}"}
+    return {"ok": True, "changed": changed, "budgets": normalized}
+
+
 def set_budget_settings(values, path=None):
     """Persist a validated machine-wide monthly budget atomically."""
     path = path or TOKEN_METER_SETTINGS
     try:
-        normalized = normalize_budget_settings(values)
+        supplied = dict(values)
+    except (TypeError, ValueError) as error:
+        return {"ok": False, "error": str(error)}
+
+    def update(current):
+        if "session_budgets" not in supplied:
+            supplied["session_budgets"] = current["session_budgets"]
+        return supplied
+
+    return _update_budget_settings(update, path)
+
+
+def effective_session_budget(session_id, settings=None):
+    """Return one opaque session's cap and whether it overrides the default."""
+    settings = normalize_budget_settings(settings if settings is not None else budget_settings())
+    session_id = str(session_id or "").strip()
+    override = (settings.get("session_budgets") or {}).get(session_id)
+    if override is not None:
+        return float(override), "session_override"
+    return float(settings["default_session_budget"]), "default"
+
+
+def set_session_budget_override(session_id, budget_usd, *, expected_current_budget_usd=None,
+                                path=None):
+    """Atomically persist a validated override for a discovered opaque session ID."""
+    session_id = str(session_id or "").strip()
+    if not session_id or len(session_id) > 240:
+        return {"ok": False, "error": "Session budget ID must be 1 to 240 characters."}
+    try:
+        budget_usd = normalize_session_budget_value(budget_usd)
+        expected = (
+            normalize_session_budget_value(
+                expected_current_budget_usd, "Expected current budget",
+            ) if expected_current_budget_usd is not None else None
+        )
     except ValueError as error:
         return {"ok": False, "error": str(error)}
-    settings = load_json(path, {})
-    if not isinstance(settings, dict):
-        settings = {}
-    changed = settings.get("budgets") != normalized
-    settings["budgets"] = normalized
+
+    def update(current):
+        current_budget, _source = effective_session_budget(session_id, current)
+        if expected is not None and expected != current_budget:
+            raise ValueError("The current session budget changed; read it again before updating.")
+        updated = dict(current)
+        overrides = dict(current.get("session_budgets") or {})
+        overrides[session_id] = budget_usd
+        updated["session_budgets"] = overrides
+        return updated
+
+    return _update_budget_settings(update, path or TOKEN_METER_SETTINGS)
+
+
+def set_default_session_budget_value(budget_usd, *, expected_current_budget_usd=None,
+                                     path=None):
+    """Atomically persist the default cap, optionally protecting a stale read."""
     try:
-        atomic_write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
-    except OSError as error:
-        return {"ok": False, "error": f"Token Meter could not save settings: {error}"}
-    return {"ok": True, "changed": changed, "budgets": normalized}
+        budget_usd = normalize_session_budget_value(budget_usd, "Default session budget")
+        expected = (
+            normalize_session_budget_value(
+                expected_current_budget_usd, "Expected current budget",
+            ) if expected_current_budget_usd is not None else None
+        )
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+
+    def update(current):
+        if expected is not None and expected != current["default_session_budget"]:
+            raise ValueError("The default session budget changed; read it again before updating.")
+        updated = dict(current)
+        updated["default_session_budget"] = budget_usd
+        return updated
+
+    return _update_budget_settings(update, path or TOKEN_METER_SETTINGS)
 
 
 def normalize_update_settings(values):
@@ -1867,7 +1945,7 @@ def set_update_settings(values, path=None):
     changed = settings.get("updates") != stored
     settings["updates"] = stored
     try:
-        atomic_write_text(path, json.dumps(settings, indent=2, ensure_ascii=False) + "\n")
+        write_settings_json(path, settings)
     except OSError as error:
         return {"ok": False, "error": f"Token Meter could not save settings: {error}"}
     _update_wake.set()
@@ -2462,6 +2540,7 @@ def normalize_dynamic_tools(dynamic_tools):
             name = child.get("name") or "?"
             namespace = child.get("namespace") or parent_namespace or "unknown"
             raw_identity = name
+            host_provided = False
             if name.startswith("mcp__"):
                 ident = tool_identity(name)
                 namespace = ident["namespace"]
@@ -2471,19 +2550,26 @@ def normalize_dynamic_tools(dynamic_tools):
                 namespace = parts[1] if len(parts) > 1 and parts[1] else "mcp"
                 raw_identity = f"mcp__{namespace}__{name}"
                 kind = "mcp"
+            elif isinstance(children, list) and namespace not in CODEX_BUILTIN_NAMESPACES:
+                raw_identity = f"mcp__{namespace}__{name}"
+                kind = "mcp"
+                host_provided = True
             else:
                 kind = "tool"
             definition = {
                 "description": child.get("description") or "",
                 "inputSchema": child.get("inputSchema") or child.get("input_schema") or {},
             }
-            out.append({
+            entry = {
                 "namespace": namespace,
                 "name": raw_identity,
                 "kind": kind,
                 "defer_loading": bool(child.get("deferLoading", parent_deferred)),
                 "definition_tokens": len(json.dumps(definition, sort_keys=True)) // CHARS_PER_TOKEN,
-            })
+            }
+            if host_provided:
+                entry["host_provided"] = True
+            out.append(entry)
     return out[:240]
 
 
@@ -2494,13 +2580,7 @@ def catalog_counts(catalog):
 
 
 def cursor_model(composer, header=None):
-    config = composer.get("modelConfig") if isinstance(composer, dict) else {}
-    if isinstance(config, dict) and config.get("modelName"):
-        return str(config["modelName"])
-    for value in (composer, header):
-        if isinstance(value, dict) and value.get("model"):
-            return str(value["model"])
-    return "unknown"
+    return cursor_model_name(composer, header)
 
 
 _claude_native_adapters = {}
@@ -2517,8 +2597,6 @@ def _claude_compatibility():
         "add_model_daily": add_model_daily,
         "add_model_summary": add_model_summary,
         "analysis_block": analysis_block,
-        "analyze_language_signals": analyze_language_signals,
-        "attach_language_signals": attach_language_signals,
         "build_insights": build_insights,
         "build_state": build_state,
         "claude_human_text": _claude_human_text,
@@ -2585,12 +2663,11 @@ def _codex_compatibility():
         "add_model_daily": add_model_daily,
         "add_model_summary": add_model_summary,
         "analysis_block": analysis_block,
-        "analyze_language_signals": analyze_language_signals,
-        "attach_language_signals": attach_language_signals,
         "build_insights": build_insights,
         "build_state": build_state,
         "catalog_counts": catalog_counts,
         "codex_approval_policy_label": codex_approval_policy_label,
+        "codex_fallback_user_text": _codex_fallback_user_text,
         "codex_live_performance_summary": codex_live_performance_summary,
         "codex_performance_samples": codex_performance_samples,
         "codex_tool_call_evidence": codex_tool_call_evidence,
@@ -2650,9 +2727,7 @@ def _cursor_compatibility():
     return {
         "zero_price": ZERO_PRICE,
         "analysis_block": analysis_block,
-        "analyze_language_signal_turns": analyze_language_signal_turns,
         "argument_fingerprint": argument_fingerprint,
-        "attach_language_signals": attach_language_signals,
         "build_state": build_state,
         "compact_text": compact_text,
         "context_sample_limit": CURRENT_SESSION_CONTEXT_SAMPLES,
@@ -2666,7 +2741,7 @@ def _cursor_compatibility():
         "cursor_timestamp": lambda *args: cursor_timestamp(*args),
         "cursor_tool_identity": lambda *args: cursor_tool_identity(*args),
         "cursor_transcript_groups": lambda *args: cursor_transcript_groups(*args),
-        "cursor_turn_timing": lambda *args: cursor_turn_timing(*args),
+        "cursor_turn_timing": lambda *args, **kwargs: cursor_turn_timing(*args, **kwargs),
         "cursor_visible_output": lambda *args: cursor_visible_output(*args),
         "duration_label": duration_label,
         "load": load,
@@ -2863,9 +2938,7 @@ def _opencode_compatibility():
     return {
         "chars_per_token": CHARS_PER_TOKEN,
         "analysis_block": analysis_block,
-        "analyze_language_signal_turns": analyze_language_signal_turns,
         "argument_fingerprint": argument_fingerprint,
-        "attach_language_signals": attach_language_signals,
         "build_insights": build_insights,
         "build_state": build_state,
         "compact_text": compact_text,
@@ -3052,6 +3125,36 @@ def supported_runtime_phrase():
     return "{}, or {}".format(", ".join(labels[:-1]), labels[-1])
 
 
+def git_delivery_project_roots(sources):
+    """Return ordered unique normalized roots relevant to Git candidate selection."""
+    roots = []
+    seen = set()
+    for source in sources or ():
+        raw_project = source.get("project") if isinstance(source, dict) else ""
+        if not isinstance(raw_project, str):
+            continue
+        if project_filter_key(raw_project) == OTHER_LOCAL_SESSIONS_PROJECT:
+            continue
+        root = os.path.abspath(os.path.expanduser(raw_project))
+        if root not in seen:
+            roots.append(root)
+            seen.add(root)
+    return tuple(roots)
+
+
+def git_delivery_source_signature(roots):
+    """Return a private ordered-root membership signature for Git candidates."""
+    return hashlib.sha256(
+        "\0".join(roots).encode("utf-8", "replace"),
+    ).hexdigest()
+
+
+def source_inventory_snapshot():
+    """Read one atomically published source inventory reference."""
+    with _source_inventory_lock:
+        return _SOURCE_INVENTORY
+
+
 def publish_source_inventory(sources):
     """Atomically publish a reusable discovery snapshot for lightweight endpoints."""
     global _SOURCE_INVENTORY
@@ -3069,20 +3172,35 @@ def publish_source_inventory(sources):
     clients = defaultdict(int)
     for source in source_rows:
         clients[source.get("client") or source.get("provider") or "unknown"] += 1
-    _SOURCE_INVENTORY = {
-        "ready": True,
-        "sources": source_rows,
-        "count": len(source_rows),
-        "clients": dict(clients),
-        "updated_at": time.time(),
-    }
-    _git_delivery_wake.set()
+    roots = git_delivery_project_roots(source_rows)
+    signature = git_delivery_source_signature(roots)
+    with _source_inventory_lock:
+        previous = _SOURCE_INVENTORY
+        candidates_changed = signature != previous.get("git_delivery_source_signature")
+        revision = int(previous.get("revision") or 0) + int(candidates_changed)
+        _SOURCE_INVENTORY = {
+            "ready": True,
+            "sources": source_rows,
+            "count": len(source_rows),
+            "clients": dict(clients),
+            "updated_at": time.time(),
+            "revision": revision,
+            "git_delivery_source_signature": signature,
+            "git_delivery_candidates": (
+                () if candidates_changed else previous.get("git_delivery_candidates") or ()
+            ),
+            "git_delivery_candidates_revision": (
+                None if candidates_changed else previous.get("git_delivery_candidates_revision")
+            ),
+        }
+    if candidates_changed:
+        _git_delivery_wake.set()
     return _SOURCE_INVENTORY
 
 
 def cached_session_sources():
     """Return the watcher-owned source snapshot without touching the filesystem."""
-    inventory = _SOURCE_INVENTORY
+    inventory = source_inventory_snapshot()
     return list(inventory.get("sources") or ()), bool(inventory.get("ready"))
 
 
@@ -3282,14 +3400,31 @@ def cursor_model_parameters(composer, model=None):
 
 
 def cursor_price_variant(composer, model):
+    config = composer.get("modelConfig") if isinstance(composer, dict) else {}
+    if isinstance(config, dict) and config.get("maxMode") is True:
+        return "max"
     for cursor_model_id in CURSOR_VARIANT_MODEL_IDS:
         if not _catalog_model_alias_matches(model, "cursor", cursor_model_id):
             continue
-        fast = cursor_model_parameters(composer, cursor_model_id).get("fast")
-        if str(fast).lower() == "true":
-            return "fast"
-        if str(fast).lower() == "false":
-            return "standard"
+        params = cursor_model_parameters(composer, cursor_model_id)
+        fast = str(params.get("fast")).lower()
+        context = str(params.get("context") or "").lower()
+        prefix = (
+            "500k-" if cursor_model_id == "grok-4.7" and context in ("500k", "500000")
+            else ""
+        )
+        if fast == "true":
+            return prefix + "fast"
+        if fast == "false":
+            return prefix + "standard"
+        return ""
+    selected = config.get("selectedModels") if isinstance(config, dict) else []
+    for row in selected or []:
+        model_id = str(row.get("modelId") or "") if isinstance(row, dict) else ""
+        if model_id and _catalog_model_alias_matches(model, "cursor", model_id):
+            if str(cursor_model_parameters(composer, model_id).get("fast")).lower() == "true":
+                return "fast"
+            break
     return ""
 
 
@@ -3374,7 +3509,8 @@ def _price_multipliers(u, model, provider, at=None):
     if timestamp is not None and timestamp < GPT_56_PRICE_UPDATE_AT:
         return 1.0, 1.0
     compact = str(model or "").replace(" ", "-").lower()
-    if provider not in ("codex", "cursor") or not compact.startswith("gpt-5.6"):
+    if (provider not in ("codex", "cursor") or
+            not compact.startswith(("gpt-5.6", "gpt-6-", "gpt-6.1-"))):
         return 1.0, 1.0
     input_tokens = (
         int(u.get("input_tokens", 0) or 0)
@@ -3387,14 +3523,15 @@ def _price_multipliers(u, model, provider, at=None):
 
 
 _CLAUDE_FAST_PREMIUM_RULES = frozenset((
-    "claude-opus-5", "claude-opus-4-8",
+    "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
 ))
 _CLAUDE_FAST_STANDARD_RULES = frozenset(("claude-opus-4-6",))
 _CLAUDE_INFERENCE_GEO_RULES = frozenset((
     "claude-mythos-5", "claude-mythos-5-1",
     "claude-fable-5", "claude-fable-5-1",
-    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
-    "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6",
+    "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+    "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5",
+    "claude-sonnet-4-6",
 ))
 
 
@@ -3442,10 +3579,10 @@ def cost_of(u, model, provider="claude", variant=None, at=None):
         cache_write_5m_rate = quote.cache_write_per_million
         if usage.get("speed") == "fast":
             if quote.matched_rule in _CLAUDE_FAST_PREMIUM_RULES:
-                input_rate = 10.0
-                output_rate = 50.0
-                cache_read_rate = 1.0
-                cache_write_5m_rate = 12.5
+                input_rate *= 2.0
+                output_rate *= 2.0
+                cache_read_rate *= 2.0
+                cache_write_5m_rate *= 2.0
 
         token_multiplier = 1.1 if usage.get("inference_geo") == "us" else 1.0
         cache_write_5m = (
@@ -3482,7 +3619,9 @@ def cost_of(u, model, provider="claude", variant=None, at=None):
             ),
             "server_tools": usage.get("web_search_requests", 0) * 0.01,
         }
-    input_multiplier, output_multiplier = _price_multipliers(u, model, provider, at)
+    input_multiplier, output_multiplier = _price_multipliers(
+        u, quote.matched_rule or model, provider, at,
+    )
     return _domain_cost_breakdown_values(
         u.get("input_tokens", 0),
         u.get("output_tokens", 0),
@@ -4094,28 +4233,6 @@ def claude_user_text(msg):
     return " ".join(p for p in pieces if isinstance(p, str))
 
 
-def frustration_term_counts(text, terms):
-    """Return exact configured term hits using word-safe, case-insensitive matching."""
-    text = str(text or "")
-    counts = {}
-    for term in terms or []:
-        escaped = re.escape(term).replace(r"\ ", r"\s+")
-        matches = re.findall(rf"(?<!\w){escaped}(?!\w)", text, flags=re.IGNORECASE)
-        if matches:
-            counts[term] = len(matches)
-    return counts
-
-
-def week_start(day):
-    if not day:
-        return ""
-    try:
-        value = datetime.date.fromisoformat(day)
-    except (TypeError, ValueError):
-        return ""
-    return (value - datetime.timedelta(days=value.weekday())).isoformat()
-
-
 def _claude_human_text(obj):
     """Return human-authored Claude text, None for tool/meta/user-shaped records."""
     if obj.get("type") != "user" or obj.get("isMeta") or obj.get("isSidechain"):
@@ -4149,153 +4266,23 @@ def _claude_human_text(obj):
     return text
 
 
-def _dedupe_user_turns(turns, window_seconds=2.0):
-    result = []
-    for turn in turns:
-        fingerprint = " ".join(str(turn.get("text") or "").lower().split())
-        previous = result[-1] if result else None
-        if previous:
-            previous_fingerprint = " ".join(str(previous.get("text") or "").lower().split())
-            delta = abs(float(turn.get("ts") or 0) - float(previous.get("ts") or 0))
-            if fingerprint == previous_fingerprint and delta <= window_seconds:
-                continue
-        result.append(turn)
-    return result
-
-
-def claude_user_turns(objs, default_model=None):
-    turns = []
-    pending = []
-    current_model = default_model or "unknown-model"
-    for obj in objs or []:
-        text = _claude_human_text(obj)
-        if text is not None:
-            turn = {
-                "ts": parse_iso(obj.get("timestamp", "")) or 0,
-                "text": text,
-                "model": None,
-            }
-            turns.append(turn)
-            pending.append(turn)
-            continue
-        if obj.get("type") != "assistant":
-            continue
-        msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
-        model = msg.get("model") or current_model
-        current_model = model
-        if pending:
-            for turn in pending:
-                turn["model"] = model
-            pending = []
-    for turn in pending:
-        turn["model"] = current_model
-    return _dedupe_user_turns(turns)
-
-
 def _codex_fallback_user_text(payload):
     if payload.get("type") != "message" or payload.get("role") != "user":
         return None
-    text = text_from_content(payload.get("content"))
-    stripped = text.strip()
-    if stripped.startswith(("# AGENTS.md instructions", "<environment_context>")):
-        return None
-    return text
-
-
-def codex_user_turns(objs, default_model=None):
-    """Prefer canonical user_message events; fall back for older Codex logs."""
-    current_model = default_model or "unknown-model"
-    event_turns = []
-    fallback_turns = []
-    for obj in objs or []:
-        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
-        if obj.get("type") == "turn_context":
-            current_model = payload.get("model") or current_model
+    content = payload.get("content")
+    blocks = content if isinstance(content, list) else [content]
+    human_blocks = []
+    for block in blocks:
+        text = text_from_content([block] if isinstance(content, list) else block)
+        stripped = text.strip()
+        if not stripped or stripped.startswith((
+                "<recommended_plugins>",
+                "# AGENTS.md instructions",
+                "<environment_context>",
+        )):
             continue
-        ts = parse_iso(obj.get("timestamp", "")) or 0
-        if payload.get("type") == "user_message":
-            event_turns.append({"ts": ts, "text": payload.get("message") or "", "model": current_model})
-            continue
-        text = _codex_fallback_user_text(payload)
-        if text is not None:
-            fallback_turns.append({"ts": ts, "text": text, "model": current_model})
-    return _dedupe_user_turns(event_turns or fallback_turns)
-
-
-def cursor_user_turns(objs, default_model=None):
-    """Extract human turns from Cursor's durable transcript without wrappers."""
-    turns = []
-    for row in objs or []:
-        if not isinstance(row, dict) or row.get("role") != "user":
-            continue
-        text = text_from_content(cursor_message_content(row))
-        match = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, flags=re.DOTALL)
-        turns.append({"ts": 0, "text": match.group(1) if match else text,
-                      "model": default_model or "unknown"})
-    return turns
-
-
-def rollup_frustration_events(events):
-    return _domain_rollup_language_signal_events(events)
-
-
-def user_turns_for_provider(provider, objs, default_model=None):
-    if provider == "codex":
-        return codex_user_turns(objs, default_model)
-    if provider == "cursor":
-        return cursor_user_turns(objs, default_model)
-    return claude_user_turns(objs, default_model)
-
-
-def language_signal_events(turns, terms, default_model=None):
-    events = []
-    for turn in turns or []:
-        ts = turn.get("ts") or 0
-        day = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
-        term_counts = frustration_term_counts(turn.get("text"), terms)
-        events.append({
-            "ts": ts,
-            "day": day,
-            "week": week_start(day),
-            "model": turn.get("model") or default_model or "unknown",
-            "utterance": bool(term_counts),
-            "matches": sum(term_counts.values()),
-            "term_counts": term_counts,
-        })
-    return events
-
-
-def analyze_language_signal_turns(turns, terms=None, default_model=None):
-    configured = language_signal_settings() if terms is None else terms
-    rollups = {}
-    events = {}
-    for group in ("positive", "friction"):
-        group_terms = list(configured.get(group) or [])
-        group_events = language_signal_events(turns, group_terms, default_model)
-        events[group] = group_events
-        rollups[group] = rollup_frustration_events(group_events)
-    return rollups, events
-
-
-def analyze_language_signals(provider, objs, terms=None, default_model=None):
-    turns = user_turns_for_provider(provider, objs, default_model)
-    return analyze_language_signal_turns(turns, terms, default_model)
-
-
-def attach_language_signals(row, rollups, events):
-    row["language_signals"] = rollups
-    row["_language_signal_events"] = events
-    row["frustration"] = rollups.get("friction") or rollup_frustration_events([])
-    row["_frustration_events"] = events.get("friction") or []
-    return row
-
-
-def analyze_frustration(provider, objs, terms=None, default_model=None):
-    """Backward-compatible Friction-only lexical analysis."""
-    configured = list(frustration_settings()["terms"] if terms is None else terms)
-    turns = user_turns_for_provider(provider, objs, default_model)
-    events = language_signal_events(turns, configured, default_model)
-    return rollup_frustration_events(events), events
+        human_blocks.append(text)
+    return "\n".join(human_blocks) if human_blocks else None
 
 
 def user_prompt_preview(texts, limit=220):
@@ -4498,7 +4485,10 @@ def skill_names_from_value(value, tool_name=""):
         text = json.dumps(value, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
         text = str(value or "")
-    names = {match.group(1) for match in SKILL_PATH_RE.finditer(text)}
+    names = {
+        match.group(1) for match in SKILL_PATH_RE.finditer(text)
+        if SKILL_NAME_RE.fullmatch(match.group(1))
+    }
     tool_leaf = str(tool_name or "").rsplit(".", 1)[-1].casefold()
     direct = value.get("skill") if tool_leaf == "skill" and isinstance(value, dict) else None
     if isinstance(direct, str):
@@ -4528,37 +4518,6 @@ def claude_tool_results(objs):
                     block.get("content"), block.get("is_error") is True
                 )
     return chars_by_id, ts_by_id, errors_by_id
-
-
-CURSOR_TOOL_IDENTITIES = {
-    "read_file_v2": ("Read", "files"),
-    "ripgrep_raw_search": ("Grep", "search"),
-    "glob_file_search": ("Glob", "search"),
-    "run_terminal_command_v2": ("Shell", "shell"),
-    "edit_file_v2": ("Edit", "files"),
-    "apply_patch": ("Apply patch", "files"),
-    "todo_write": ("Todo", "planning"),
-    "web_search": ("Web search", "web"),
-    "web_fetch": ("Web fetch", "web"),
-    "delete_file": ("Delete", "files"),
-    "await": ("Await", "orchestration"),
-}
-CURSOR_TOOL_ALIASES = {
-    "read": "read_file_v2", "readfile": "read_file_v2", "read_file": "read_file_v2",
-    "grep": "ripgrep_raw_search", "rg": "ripgrep_raw_search",
-    "glob": "glob_file_search", "shell": "run_terminal_command_v2",
-    "edit": "edit_file_v2", "applypatch": "apply_patch",
-    "todowrite": "todo_write", "websearch": "web_search", "webfetch": "web_fetch",
-    "delete": "delete_file", "deletefile": "delete_file",
-}
-
-
-def cursor_tool_identity(name):
-    raw = str(name or "?")
-    alias = re.sub(r"[^a-z0-9_]", "", raw.lower())
-    canonical = CURSOR_TOOL_ALIASES.get(alias, raw)
-    display, namespace = CURSOR_TOOL_IDENTITIES.get(canonical, (canonical, "cursor"))
-    return {"name": canonical, "display": display, "namespace": namespace, "kind": "tool"}
 
 
 def cursor_timestamp(value):
@@ -4647,14 +4606,27 @@ def cursor_enriched_groups(snapshot):
     return groups
 
 
-def cursor_turn_timing(spans, start_ts, next_start_ts=0, terminal_ts=0, turn_duration_ms=0):
-    boundary = float(next_start_ts or (terminal_ts + 24 * 60 * 60) or float("inf"))
-    matches = [
-        row for row in spans or []
-        if row.get("end_ts", 0) >= float(start_ts or 0) - 1
-        and row.get("start_ts", 0) < boundary
-        and row.get("end_ts", 0) <= boundary + 1
-    ]
+CURSOR_SPAN_LEAD_S = 5.0
+
+
+def cursor_turn_timing(spans, start_ts, next_start_ts=0, terminal_ts=0, turn_duration_ms=0,
+                       request_id="", claimed_request_ids=frozenset()):
+    # Spans carrying a known turn requestId belong to that turn. Others are
+    # attributed by start: Cursor opens spans a few seconds before the user
+    # bubble's createdAt, and a turn's spans can outlive the next queued turn.
+    lower = float(start_ts or 0) - CURSOR_SPAN_LEAD_S
+    if next_start_ts:
+        upper = max(lower, float(next_start_ts) - CURSOR_SPAN_LEAD_S)
+    else:
+        upper = float((terminal_ts + 24 * 60 * 60) if terminal_ts else float("inf"))
+
+    def owned(row):
+        row_request = row.get("request_id") or ""
+        if row_request and row_request in claimed_request_ids:
+            return row_request == request_id
+        return lower <= row.get("start_ts", 0) < upper
+
+    matches = [row for row in spans or [] if owned(row)]
     submits = [row for row in matches if row.get("name") == "ComposerChatService.submitChatMaybeAbortCurrent"]
     attempts = [row for row in matches if row.get("name") == "agent.request.attempt"]
     rpc_errors = {
@@ -4662,7 +4634,7 @@ def cursor_turn_timing(spans, start_ts, next_start_ts=0, terminal_ts=0, turn_dur
         if row.get("name") == "rpc.run" and row.get("error") and row.get("request_id")
     }
     ttfts = [row for row in matches if row.get("name") == "client.ttft" and row.get("duration_s", 0) > 0]
-    final_ts = max((row["end_ts"] for row in submits), default=float(terminal_ts or 0))
+    final_ts = max((row["end_ts"] for row in submits + attempts), default=float(terminal_ts or 0))
     intervals = [(row["start_ts"], row["end_ts"]) for row in attempts]
     try:
         fallback_s = max(0.0, float(turn_duration_ms or 0) / 1000.0)
@@ -4805,7 +4777,8 @@ def cursor_pricing_note(model, variant, supported):
     rate = "selected-model public API rates"
     for cursor_model_id in CURSOR_VARIANT_MODEL_IDS:
         if _catalog_model_alias_matches(model, "cursor", cursor_model_id):
-            rate = f"{cursor_model_id.replace('-', ' ').title()} {variant.title()} public rates"
+            rate = (f"{cursor_model_id.replace('-', ' ').title()} "
+                    f"{variant.replace('-', ' ').title()} public rates")
             break
     return f"Local Cursor estimate ({basis}), priced with {rate}; cache and hidden model work are excluded."
 
@@ -4917,6 +4890,7 @@ def recompute(source):
     return result.value
 
 
+
 def source_revision_signature(source):
     """Track trace activity plus display metadata stored outside the trace."""
     if not source:
@@ -5017,7 +4991,7 @@ def analysis_block(tot, total_cost, think_out, think_turns, think_cost, model_to
 
 def new_codex_pending():
     return {"trace": [], "calls": {}, "has_reasoning": False, "start_ts": None,
-            "context_window": None, "user_inputs": []}
+            "context_window": None, "user_inputs": [], "fallback_user_inputs": []}
 
 
 def codex_approval_policy_label(value):
@@ -5083,6 +5057,18 @@ def build_state(source, tot, cost, total_tokens, total_cost, series, executions,
     tool_data["catalog_coverage"] = catalog_coverage
     tool_data["loaded_namespaces"] = list(source.get("tool_namespaces") or [])
     tool_data["catalog"] = tool_catalog[:80]
+    capabilities = _domain_session_capabilities(
+        {
+            "skills": tool_data.get("skills"),
+            "tools": [tool for row in executions for tool in row.get("tools") or ()],
+            "catalog": tool_catalog,
+        },
+        source.get("_loaded_skills"),
+        source.get("_loaded_mcp_servers"),
+    )
+    capabilities = with_configured_capabilities(
+        capabilities, source.get("provider"), source.get("project") or "",
+    )
     availability = availability or metric_availability(
         source["provider"], context=bool(context_window),
         timing=bool(active_available or wait_samples),
@@ -5133,6 +5119,7 @@ def build_state(source, tot, cost, total_tokens, total_cost, series, executions,
         "primary_model": primary_model,
         "turns": len(series),
         "subagent_turns": side_turns,
+        "capabilities": capabilities,
         "cache_ratio": cache_ratio,
         "cache_saved": cache["saved"],
         "cache": cache,
@@ -5232,8 +5219,11 @@ def cache_savings(tot, provider, model, executions=None):
                 "cache_read_input_tokens": cache_read,
                 "output_tokens": int(tokens.get("output", 0) or 0),
             }
-            p, _ = price_for(execution_model, provider, variant, at=at)
-            input_multiplier, _ = _price_multipliers(usage, execution_model, provider, at)
+            quote, _ = _resolved_price_quote(execution_model, provider, variant, at=at)
+            p = quote.to_legacy_price() or ZERO_PRICE
+            input_multiplier, _ = _price_multipliers(
+                usage, quote.matched_rule or execution_model, provider, at,
+            )
             saved += _domain_cache_savings_for_rate(
                 cache_read,
                 p["input"],
@@ -5338,6 +5328,7 @@ def codex_tool_call_evidence(objs):
         ts = parse_iso(obj.get("timestamp", "")) or 0
         if ptype in ("function_call", "custom_tool_call", "web_search_call", "tool_search_call"):
             name = payload.get("name") or ("web.search" if ptype == "web_search_call" else ptype.replace("_call", ""))
+            name = codex_mcp_tool_name(name, payload.get("namespace"))
             call_id = payload.get("call_id") or payload.get("id") or f"call-{len(order) + 1}"
             if call_id not in calls:
                 arguments = payload.get("arguments") or payload.get("input")
@@ -5347,7 +5338,20 @@ def codex_tool_call_evidence(objs):
                     "args_fingerprint": argument_fingerprint(arguments),
                     "skills": skill_names_from_value(arguments, name),
                 }
+                if codex_host_provided(name):
+                    calls[call_id]["host_provided"] = True
                 order.append(call_id)
+                if ptype == "custom_tool_call" and name == "exec":
+                    for index, nested in enumerate(codex_nested_tool_names(arguments)):
+                        nested_id = f"{call_id}#nested-{index}"
+                        calls[nested_id] = {
+                            **tool_identity(nested), "output_chars": 0, "output_tokens": 0,
+                            "error": False, "ts": ts, "args_fingerprint": "",
+                            "skills": [], "nested": True,
+                        }
+                        if codex_host_provided(nested):
+                            calls[nested_id]["host_provided"] = True
+                        order.append(nested_id)
             continue
         if ptype not in ("function_call_output", "custom_tool_call_output", "web_search_end", "tool_search_output", "patch_apply_end"):
             continue
@@ -5523,6 +5527,11 @@ def session_summary(source, opencode_conn=None):
     else:
         row = summary_row(source, source.get("title"), 0.0, 0, 0, set(), None, None,
                           {}, {}, {}, False, availability=metric_availability("unknown"))
+    if isinstance(row, dict):
+        row["capabilities"] = with_configured_capabilities(
+            row.get("capabilities") or _domain_session_capabilities(row.get("_tool_evidence")),
+            source.get("provider"), source.get("project") or row.get("project") or "",
+        )
     with _summary_cache_lock:
         _summary_cache[source["path"]] = {"signature": signature, "row": row}
     return row
@@ -5550,14 +5559,171 @@ def current_session_summaries(rows, now=None, max_age_s=CURRENT_SESSION_MAX_AGE_
     )
 
 
+def folded_child_root_id(source):
+    """Return the root session id an additive child source folds into, if any.
+
+    Only OpenCode child sessions with a resolved root carry `agent_root_id`;
+    every other source returns an empty string and keeps its own identity.
+    """
+    if not isinstance(source, dict) or source.get("provider") != "opencode":
+        return ""
+    return str(source.get("agent_root_id") or "")
+
+
+def fold_child_source(selected, sources):
+    """Map a folded child source to its discovered root source, else keep it."""
+    root_id = folded_child_root_id(selected)
+    if not root_id:
+        return selected
+    for source in sources or ():
+        if (
+            source.get("provider") == selected.get("provider")
+            and str(source.get("id") or "") == root_id
+        ):
+            return source
+    return selected
+
+
+def newest_current_source(sources):
+    """Pick the live source, keeping a child run under its root session."""
+    rows = list(sources or ())
+    if not rows:
+        return None
+    newest = max(rows, key=lambda source: source.get("mtime") or 0)
+    return fold_child_source(newest, rows)
+
+
+def session_budget_family(session_id, rows=None, root_id=None):
+    """Return the budget owner id, root row, and child rows for one session.
+
+    An OpenCode child run has no separate session cap: it spends against its
+    root session's cap, which in turn includes every child's spend.
+    """
+    sid = str(session_id or "")
+    rows = list(rows if rows is not None else (_xsess.get("sessions") or ()))
+    owner = str(root_id or "")
+    if not owner:
+        own = next((
+            row for row in rows
+            if str(row.get("id") or "") == sid and row.get("provider") == "opencode"
+        ), None)
+        owner = (
+            str(own.get("root_session_id") or "")
+            if own and own.get("is_child_session") else ""
+        ) or sid
+    root_row = next((
+        row for row in rows
+        if str(row.get("id") or "") == owner and row.get("provider") == "opencode"
+        and not row.get("is_child_session")
+    ), None)
+    children = [
+        row for row in rows
+        if row.get("provider") == "opencode" and row.get("is_child_session")
+        and str(row.get("root_session_id") or "") == owner
+    ] if owner else []
+    return owner, root_row, children
+
+
+def capability_host(session):
+    """Return the inventory runtime whose installed skills/plugins a session loads."""
+    provider = str((session or {}).get("provider") or "").lower()
+    if provider == "codex":
+        return "Codex"
+    if provider == "claude":
+        path = os.path.abspath(os.path.expanduser(str(session.get("path") or "")))
+        root = os.path.abspath(CLAUDE_PROJECTS)
+        # Claude Code and the desktop Code tab load ~/.claude plugins; Cowork does not.
+        return "Claude" if path.startswith(root + os.sep) else "Claude Desktop"
+    return None
+
+
 def global_tool_waste(session_rows):
     return _domain_global_tool_waste(
         session_rows, runtime_resolver=source_runtime_label,
+        capability_host_resolver=capability_host,
     )
 
 
 def codex_mcp_states():
     return {name: bool(row.get("enabled")) for name, row in toml_named_sections(CODEX_CONFIG, "mcp_servers").items()}
+
+
+_CONFIGURED_CAPABILITY_TTL_S = 60.0
+_configured_capability_cache = {}
+_configured_capability_cache_lock = threading.Lock()
+
+
+def _skill_dir_names(*roots):
+    names = set()
+    for root in roots:
+        for path in glob.glob(os.path.join(root, "*", "SKILL.md")):
+            names.add(os.path.basename(os.path.dirname(path)))
+    return names
+
+
+def _json_mcp_server_names(*paths):
+    names = set()
+    for path in paths:
+        data = load_json(path, {})
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        if isinstance(servers, dict):
+            names.update(str(name) for name in servers)
+    return names
+
+
+def _scan_configured_capabilities(provider, project):
+    if provider == "codex":
+        skills = {
+            row["name"] for row in discovered_skills()
+            if row.get("runtime") == "Codex" and row.get("enabled") is not False
+        }
+        return skills, {name for name, enabled in codex_mcp_states().items() if enabled}
+    if provider == "cursor":
+        cursor_root = os.path.expanduser("~/.cursor")
+        project_root = os.path.join(project, ".cursor") if project and os.path.isabs(project) else ""
+        skill_roots = [os.path.join(cursor_root, "skills"), os.path.join(cursor_root, "skills-cursor")]
+        mcp_paths = [os.path.join(cursor_root, "mcp.json")]
+        if project_root:
+            skill_roots.append(os.path.join(project_root, "skills"))
+            mcp_paths.append(os.path.join(project_root, "mcp.json"))
+        return _skill_dir_names(*skill_roots), _json_mcp_server_names(*mcp_paths)
+    return None, None
+
+
+def configured_capabilities(provider, project=""):
+    """Return currently configured skill and MCP names for runtimes whose traces omit them."""
+    key = (str(provider or ""), str(project or ""))
+    now = time.monotonic()
+    with _configured_capability_cache_lock:
+        cached = _configured_capability_cache.get(key)
+        if cached and now - cached[0] < _CONFIGURED_CAPABILITY_TTL_S:
+            return cached[1]
+    result = _scan_configured_capabilities(*key)
+    with _configured_capability_cache_lock:
+        if len(_configured_capability_cache) > 256:
+            _configured_capability_cache.clear()
+        _configured_capability_cache[key] = (now, result)
+    return result
+
+
+def with_configured_capabilities(capabilities, provider, project=""):
+    """Fill unrecorded loaded counts from current configuration and label each basis."""
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    configured = None
+    result = {}
+    for index, key in enumerate(("skills", "mcp_servers")):
+        counts = dict(capabilities.get(key) or {})
+        used = int(counts.get("used") or 0)
+        loaded = counts.get("loaded")
+        basis = "session" if isinstance(loaded, int) else "unavailable"
+        if loaded is None:
+            if configured is None:
+                configured = configured_capabilities(provider, project)
+            names = configured[index]
+            if names is not None:
+                loaded, basis = max(len(names), used), "configured"
+        result[key] = {"loaded": loaded, "used": used, "basis": basis}
+    return result
 
 
 def claude_mcp_states():
@@ -5692,11 +5858,16 @@ def discovered_skills(skill_usage=None):
     }
     for row in rows:
         used = usage.get(str(row.get("name") or "").lower()) or {}
-        providers = {
-            str(provider).lower() for provider in used.get("providers") or []
-        }
-        expected_provider = "codex" if row.get("runtime") == "Codex" else "claude"
-        if providers and expected_provider not in providers:
+        if isinstance(used.get("hosts"), dict):
+            used = used["hosts"].get(row.get("runtime")) or {}
+        else:
+            providers = {
+                str(provider).lower() for provider in used.get("providers") or []
+            }
+            expected_provider = "codex" if row.get("runtime") == "Codex" else "claude"
+            if providers and expected_provider not in providers:
+                used = {}
+        if not int(used.get("activations") or 0):
             used = {}
         row.update({
             "used": bool(used),
@@ -5730,7 +5901,7 @@ def capability_inventory(waste=None):
     tool_evidence = waste.get("inventory_tools") or waste.get("by_name") or []
     tool_items = []
     for row in tool_evidence:
-        if row.get("kind") == "mcp":
+        if row.get("kind") == "mcp" and not row.get("host_provided"):
             continue
         advertised = int(row.get("advertised_sessions") or 0)
         eager = int(row.get("eager_sessions") or 0)
@@ -5746,44 +5917,78 @@ def capability_inventory(waste=None):
             "enabled": None, "configuration": "Unknown", "mutable": False,
             "used": bool(row.get("calls")),
             "calls": int(row.get("calls") or 0), "returned_tokens": int(row.get("output_tokens") or 0),
+            "nested_calls": int(row.get("nested_calls") or 0),
             "advertised_sessions": advertised, "eager_sessions": eager, "deferred_sessions": deferred,
             "last_used": row.get("last_used") or "Never", "recommendation": row.get("recommendation") or "keep",
         })
 
     codex_states, claude_states = codex_mcp_states(), claude_mcp_states()
+
+    def mcp_key(name):
+        # Codex sanitizes configured server names (ghost-mcp-proxy -> ghost_mcp_proxy).
+        return str(name or "").replace("-", "_").casefold()
+
+    display_names = {}
+    for name in (*codex_states, *claude_states):
+        display_names.setdefault(mcp_key(name), name)
+    codex_by_key = {mcp_key(name): value for name, value in codex_states.items()}
+    claude_by_key = {mcp_key(name): value for name, value in claude_states.items()}
     mcp_usage = defaultdict(lambda: {
-        "calls": 0, "tokens": 0, "last_used": "Never", "used": False,
+        "calls": 0, "nested_calls": 0, "tokens": 0, "last_used": "Never", "used": False,
+        "providers": set(),
         "definition_tokens": 0, "eager_definition_tokens": 0,
         "deferred_definition_tokens": 0, "unused_eager_definition_tokens": 0,
     })
     for row in tool_evidence:
-        if row.get("kind") != "mcp":
+        if row.get("kind") != "mcp" or row.get("host_provided"):
             continue
         name = row.get("mcp_server") or row.get("namespace") or "mcp"
-        u = mcp_usage[name]
+        key = mcp_key(name)
+        display_names.setdefault(key, name)
+        u = mcp_usage[key]
         u["calls"] += int(row.get("calls") or 0)
+        u["nested_calls"] += int(row.get("nested_calls") or 0)
         u["tokens"] += int(row.get("output_tokens") or 0)
         u["used"] = u["used"] or bool(row.get("calls"))
-        for key in ("definition_tokens", "eager_definition_tokens", "deferred_definition_tokens",
-                    "unused_eager_definition_tokens"):
-            u[key] += int(row.get(key) or 0)
-        if row.get("last_ts") and row.get("last_used"):
-            u["last_used"] = row["last_used"]
-    all_mcp_names = set(codex_states) | set(claude_states) | set(mcp_usage)
+        u["providers"].update(str(value).lower() for value in row.get("providers") or ())
+        for metric in ("definition_tokens", "eager_definition_tokens", "deferred_definition_tokens",
+                       "unused_eager_definition_tokens"):
+            u[metric] += int(row.get(metric) or 0)
+        last_used = row.get("last_used") or "Never"
+        if row.get("last_ts") and last_used != "Never" and (
+            u["last_used"] == "Never" or last_used > u["last_used"]
+        ):
+            u["last_used"] = last_used
+    provider_labels = {"codex": "Codex", "claude": "Claude", "cursor": "Cursor"}
     mcp_items = []
-    for name in sorted(all_mcp_names):
-        codex_on = bool(codex_states.get(name))
-        claude_on = bool(claude_states.get(name))
-        usage_row = mcp_usage[name]
-        enabled = codex_on or claude_on
+    for key in sorted(display_names, key=lambda item: display_names[item].casefold()):
+        name = display_names[key]
+        codex_on = bool(codex_by_key.get(key))
+        claude_on = bool(claude_by_key.get(key))
+        configured = key in codex_by_key or key in claude_by_key
+        usage_row = mcp_usage[key]
+        enabled = (codex_on or claude_on) if configured else None
+        configuration = ("Enabled" if enabled else "Disabled") if configured else "Not in config"
+        runtimes = set()
+        if key in codex_by_key:
+            runtimes.add("Codex")
+        if key in claude_by_key:
+            runtimes.add("Claude")
+        runtimes.update(
+            provider_labels.get(provider, provider.title())
+            for provider in usage_row["providers"] if provider
+        )
         mcp_items.append({
-            "id": f"mcp:{name}", "type": "mcp", "name": name, "runtime": "Codex + Claude",
-            "source": "trace/config",
-            "state": "Enabled" if enabled else "Disabled", "enabled": enabled,
-            "configuration": "Enabled" if enabled else "Disabled",
+            "id": f"mcp:{name}", "type": "mcp", "name": name,
+            "runtime": " + ".join(sorted(runtimes)) or "Unknown",
+            "source": "trace/config" if configured else "trace",
+            "configured": configured,
+            "state": configuration, "enabled": enabled,
+            "configuration": configuration,
             "mutable": False,
             "codex_enabled": codex_on, "claude_enabled": claude_on, "used": usage_row["used"],
-            "calls": usage_row["calls"], "returned_tokens": usage_row["tokens"], "last_used": usage_row["last_used"],
+            "calls": usage_row["calls"], "nested_calls": usage_row["nested_calls"],
+            "returned_tokens": usage_row["tokens"], "last_used": usage_row["last_used"],
             "definition_tokens": usage_row["definition_tokens"],
             "eager_definition_tokens": usage_row["eager_definition_tokens"],
             "deferred_definition_tokens": usage_row["deferred_definition_tokens"],
@@ -5792,8 +5997,14 @@ def capability_inventory(waste=None):
 
     skill_items = discovered_skills(waste.get("skills") or [])
     control_groups = capability_control_groups(mcp_items, skill_items)
+    observed_hosts = waste.get("capability_host_sessions")
     observed_runtimes = waste.get("runtime_sessions")
-    if observed_runtimes is not None:
+    if observed_hosts is not None:
+        runtime_sessions = {
+            runtime: int(observed_hosts.get(runtime) or 0)
+            for runtime in ("Codex", "Claude", "Claude Desktop", "Cursor")
+        }
+    elif observed_runtimes is not None:
         runtime_sessions = {
             "Codex": int(observed_runtimes.get("Codex") or 0),
             "Claude": int(observed_runtimes.get("Claude") or 0)
@@ -5892,11 +6103,19 @@ def dashboard_state_payload(state):
         ):
             public_tools.pop(removed, None)
         payload["tools"] = public_tools
+    if isinstance(state.get("agent_group"), dict):
+        payload["agent_group"] = _agent_group_projection(
+            state.get("agent_group")
+        )
     payload["runtime_catalog"] = _runtime_catalog(runtime_registry().descriptors)
     cross = state.get("xsession")
     if isinstance(cross, dict):
         public_cross = dict(cross)
         public_cross.pop("tool_waste", None)
+        if isinstance(cross.get("agent_usage"), dict):
+            public_cross["agent_usage"] = _agent_usage_projection(
+                cross.get("agent_usage")
+            )
         if isinstance(cross.get("capabilities"), dict):
             public_cross["capabilities"] = capability_summary_payload(
                 cross.get("capabilities")
@@ -5962,7 +6181,18 @@ def attach_cross_session(state, cross=None):
         return state
     cross = cross or cross_session()
     state["xsession"] = cross
+    state["session_budget"] = session_budget_snapshot(
+        state.get("source") or {}, state,
+    )
     state["optional_capabilities"] = session_optional_capabilities(state, cross.get("capabilities") or {})
+    source_id = str(((state.get("source") or {}).get("id") or ""))
+    group = _domain_find_agent_group(
+        _xsess.get("agent_groups") or (), source_id,
+    )
+    if group:
+        state["agent_group"] = _agent_group_projection(group)
+    else:
+        state.pop("agent_group", None)
     return state
 
 
@@ -6674,18 +6904,30 @@ def pace_match_distance(left, right):
     right_tools = int(right.get("tool_calls") or 0)
     if bool(left_tools) != bool(right_tools):
         return None
-    dimensions = [
-        (_pace_log_distance(
-            left.get("peak_input_tokens") or left.get("input_tokens"),
-            right.get("peak_input_tokens") or right.get("input_tokens"), 2.0,
-        ), 0.28),
-        (_pace_log_distance(left.get("input_tokens"), right.get("input_tokens"), 3.0), 0.17),
-        (_pace_log_distance(left.get("output_tokens"), right.get("output_tokens"), 2.0), 0.22),
-        (_pace_log_distance(left.get("model_calls") or 1, right.get("model_calls") or 1, 2.0), 0.16),
-    ]
-    if left_tools:
-        dimensions.append((_pace_log_distance(left_tools, right_tools, 2.0), 0.12))
-    if any(distance is None for distance, _ in dimensions):
+    # Reject on the first failing dimension instead of scoring all of them and
+    # discarding the result. Measured over real histories, output rejects the
+    # most candidates and input almost none, so the cheap discriminating gates
+    # run first and the cost of a rejected pair stays low.
+    output_distance = _pace_log_distance(
+        left.get("output_tokens"), right.get("output_tokens"), 2.0,
+    )
+    if output_distance is None:
+        return None
+    peak_distance = _pace_log_distance(
+        left.get("peak_input_tokens") or left.get("input_tokens"),
+        right.get("peak_input_tokens") or right.get("input_tokens"), 2.0,
+    )
+    if peak_distance is None:
+        return None
+    input_distance = _pace_log_distance(
+        left.get("input_tokens"), right.get("input_tokens"), 3.0,
+    )
+    if input_distance is None:
+        return None
+    model_distance = _pace_log_distance(
+        left.get("model_calls") or 1, right.get("model_calls") or 1, 2.0,
+    )
+    if model_distance is None:
         return None
     left_input = max(1, int(left.get("input_tokens") or 0))
     right_input = max(1, int(right.get("input_tokens") or 0))
@@ -6694,7 +6936,15 @@ def pace_match_distance(left, right):
     cache_distance = abs(left_cache - right_cache)
     if cache_distance > 0.60:
         return None
-    score = sum(distance * weight for distance, weight in dimensions)
+    score = peak_distance * 0.28
+    score += input_distance * 0.17
+    score += output_distance * 0.22
+    score += model_distance * 0.16
+    if left_tools:
+        tool_distance = _pace_log_distance(left_tools, right_tools, 2.0)
+        if tool_distance is None:
+            return None
+        score += tool_distance * 0.12
     score += (cache_distance / 0.60) * 0.05
     recency_days = abs(float(left.get("ts") or 0) - float(right.get("ts") or 0)) / 86400.0
     score += min(1.0, recency_days / 90.0) * 0.03
@@ -6789,8 +7039,268 @@ def matched_pace_comparison(a_id, a_samples, b_id, b_samples, distance_cache=Non
     return result
 
 
-def matched_pace_windows(sample_groups, now_ts=None):
-    """Build pairwise matched-pace comparisons for every dashboard history window."""
+def _pace_samples_signature(samples, fields):
+    """Return a stable digest of the fields that affect a pace comparison."""
+    digest = hashlib.sha256()
+    for sample in samples or ():
+        digest.update(b"\0sample\0")
+        digest.update(
+            repr(tuple(sample.get(field) for field in fields)).encode(
+                "utf-8", errors="replace",
+            )
+        )
+    return digest.hexdigest()
+
+
+MATCHED_PACE_WINDOW_KEYS = (
+    "today", "yesterday", "7", "30", "90", "month", "last_month", "all",
+)
+_MATCHED_PACE_INT_FIELDS = ("a_samples", "b_samples", "matched_pairs")
+_MATCHED_PACE_FLOAT_FIELDS = ("coverage", "pace_ratio", "ci_low", "ci_high")
+
+
+_MATCHED_PACE_COMPARISON_KEYS = frozenset(
+    ("a_id", "b_id", "available", "reason")
+    + _MATCHED_PACE_INT_FIELDS + _MATCHED_PACE_FLOAT_FIELDS
+)
+# Stored numbers outside these bounds are corrupt; the pair is recomputed.
+_MATCHED_PACE_MAX_COUNT = 10 ** 9
+_MATCHED_PACE_MAX_RATIO = 1e15
+_MATCHED_PACE_MAX_REASON = 200
+# Every reason string matched_pace_comparison can produce.
+_MATCHED_PACE_REASON_RE = re.compile(
+    r"|needs \d{1,9} timed turns per runtime"
+    r"|only \d{1,9} comparable turns; needs \d{1,9}"
+    r"|only \d{1,9}% of the smaller history overlaps"
+)
+
+
+def _valid_matched_pace_comparison(value, a_id, b_id):
+    """Return a rebuilt comparison with exactly the builder keys, else None.
+
+    Never raises: magnitude checks run before any float conversion, so a huge
+    JSON integer cannot overflow. Unknown keys reject the comparison so stored
+    content can never reach API output beyond the builder's own fields.
+    """
+    if not isinstance(value, dict) or set(value) != _MATCHED_PACE_COMPARISON_KEYS:
+        return None
+    if value["a_id"] != a_id or value["b_id"] != b_id:
+        return None
+    for field in _MATCHED_PACE_INT_FIELDS:
+        number = value[field]
+        if (isinstance(number, bool) or not isinstance(number, int)
+                or not 0 <= number <= _MATCHED_PACE_MAX_COUNT):
+            return None
+    for field in _MATCHED_PACE_FLOAT_FIELDS:
+        number = value[field]
+        if isinstance(number, bool) or not isinstance(number, (int, float)):
+            return None
+        # Chained comparison is exact for ints of any size and rejects NaN.
+        if not 0 <= number <= _MATCHED_PACE_MAX_RATIO:
+            return None
+        if isinstance(number, float) and not math.isfinite(number):
+            return None
+    if not 0 <= value["coverage"] <= 1:
+        return None
+    if not isinstance(value["available"], bool):
+        return None
+    reason = value["reason"]
+    if (not isinstance(reason, str) or len(reason) > _MATCHED_PACE_MAX_REASON
+            or not _MATCHED_PACE_REASON_RE.fullmatch(reason)):
+        return None
+    return {key: value[key] for key in (
+        "a_id", "b_id", "a_samples", "b_samples", "matched_pairs", "coverage",
+        "pace_ratio", "ci_low", "ci_high", "available", "reason",
+    )}
+
+
+def _valid_matched_pace_entry(entry):
+    """Return the (key, cached) pair for a usable stored entry, else None."""
+    if not isinstance(entry, dict):
+        return None
+    a_id, b_id = entry.get("a_id"), entry.get("b_id")
+    signature, windows = entry.get("signature"), entry.get("windows")
+    if not (isinstance(a_id, str) and isinstance(b_id, str)
+            and isinstance(signature, str) and isinstance(windows, dict)):
+        return None
+    if set(windows) != set(MATCHED_PACE_WINDOW_KEYS):
+        return None
+    rebuilt = {}
+    for window in MATCHED_PACE_WINDOW_KEYS:
+        comparison = _valid_matched_pace_comparison(windows[window], a_id, b_id)
+        if comparison is None:
+            return None
+        rebuilt[window] = comparison
+    return (a_id, b_id), {"signature": signature, "windows": rebuilt}
+
+
+def _ensure_matched_pace_cache_loaded():
+    """Load the persisted pair cache once. Caller holds the single-flight flag."""
+    global _matched_pace_pair_cache_loaded
+    if _matched_pace_pair_cache_loaded:
+        return
+    _matched_pace_pair_cache_loaded = True
+    if not _matched_pace_persist:
+        return
+    try:
+        with open(TOKEN_METER_MATCHED_PACE_CACHE, encoding="utf-8") as fh:
+            stored = json.load(fh)
+    except (OSError, ValueError, RecursionError):
+        # Missing, unreadable, undecodable (including invalid UTF-8), or
+        # malformed files are a cold cache, never a request failure.
+        return
+    if not isinstance(stored, dict):
+        return
+    if stored.get("schema") != MATCHED_PACE_CACHE_SCHEMA:
+        return
+    pairs = stored.get("pairs")
+    if not isinstance(pairs, list):
+        return
+    for entry in pairs:
+        if len(_matched_pace_pair_cache) >= MATCHED_PACE_CACHE_MAX_PAIRS:
+            break
+        try:
+            valid = _valid_matched_pace_entry(entry)
+        except (OverflowError, TypeError, ValueError, RecursionError):
+            # Defense in depth: one malformed entry is skipped, never fatal.
+            valid = None
+        if valid is not None:
+            _matched_pace_pair_cache[valid[0]] = valid[1]
+
+
+def _save_matched_pace_pair_cache():
+    """Persist the pair cache so a restart reuses unchanged comparisons.
+
+    The stored fields are model and runtime identifiers plus aggregate duration,
+    token, ratio, and coverage numbers. No prompt, response, tool, path, or raw
+    trace content is written. Caller holds the single-flight flag.
+    """
+    if not _matched_pace_persist:
+        return
+    entries = [
+        {
+            "a_id": pair_key[0],
+            "b_id": pair_key[1],
+            "signature": cached.get("signature"),
+            "windows": cached.get("windows"),
+        }
+        for pair_key, cached in _matched_pace_pair_cache.items()
+    ]
+    try:
+        atomic_write_text(
+            TOKEN_METER_MATCHED_PACE_CACHE,
+            json.dumps({"schema": MATCHED_PACE_CACHE_SCHEMA, "pairs": entries}),
+        )
+    except OSError:
+        pass
+
+
+def _build_matched_pace_windows(sample_groups, today, signature_fields, pair_cache):
+    """Compute every model-runtime pair comparison, reusing ``pair_cache``.
+
+    Returns ``(data, changed)`` where ``changed`` reports whether any pair cache
+    entry was added, replaced, or removed. Caller owns no lock; for the global
+    pair cache the caller holds the single-flight flag.
+    """
+    changed = False
+    last_month_end = today.replace(day=1) - datetime.timedelta(days=1)
+    rules = {
+        "today": ("exact", today.isoformat()),
+        "yesterday": ("exact", (today - datetime.timedelta(days=1)).isoformat()),
+        "7": ("since", (today - datetime.timedelta(days=6)).isoformat()),
+        "30": ("since", (today - datetime.timedelta(days=29)).isoformat()),
+        "90": ("since", (today - datetime.timedelta(days=89)).isoformat()),
+        "month": ("month", today.isoformat()[:7]),
+        "last_month": ("month", last_month_end.isoformat()[:7]),
+        "all": ("all", ""),
+    }
+    result = {window: [] for window in rules}
+    ids = sorted(sample_groups)
+    windowed_samples = {}
+    id_signatures = {}
+    for runtime_id in ids:
+        buckets = {window: [] for window in rules}
+        for sample in sample_groups[runtime_id]:
+            day = str(sample.get("day") or "")
+            for window, (match, boundary) in rules.items():
+                if (
+                    match == "all"
+                    or (match == "exact" and day == boundary)
+                    or (match == "since" and day >= boundary)
+                    or (match == "month" and day[:7] == boundary)
+                ):
+                    buckets[window].append(sample)
+        windowed_samples[runtime_id] = buckets
+        id_signatures[runtime_id] = _pace_samples_signature(
+            sample_groups[runtime_id], signature_fields,
+        )
+    live_pairs = {
+        (a_id, b_id)
+        for a_index, a_id in enumerate(ids) for b_id in ids[a_index + 1:]
+    }
+    # Drop pairs that no longer exist before admitting new ones, so the freed
+    # room is usable in this same build.
+    for stale_key in set(pair_cache) - live_pairs:
+        del pair_cache[stale_key]
+        changed = True
+    for a_index, a_id in enumerate(ids):
+        for b_id in ids[a_index + 1:]:
+            pair_key = (a_id, b_id)
+            # Windows are cut relative to today, so the day is part of the key:
+            # a cached pair from a previous day must never be reused.
+            pair_signature = (
+                f"{today.isoformat()}|{id_signatures[a_id]}|{id_signatures[b_id]}"
+            )
+            cached = pair_cache.get(pair_key)
+            if cached is not None and cached["signature"] == pair_signature:
+                per_window = cached["windows"]
+            else:
+                # Every model-runtime pair is an all-pairs comparison of its
+                # completed turns. Caching per pair means a new turn for one
+                # model only rebuilds the pairs that model takes part in,
+                # instead of every pair in the cross-session state.
+                distance_cache = {}
+                per_window = {
+                    window: matched_pace_comparison(
+                        a_id, windowed_samples[a_id][window],
+                        b_id, windowed_samples[b_id][window],
+                        distance_cache=distance_cache,
+                    )
+                    for window in rules
+                }
+                # Bound memory and the persisted file. A cached pair is always
+                # refreshed in place; a new pair is admitted only while there
+                # is room. Pairs beyond the cap are still reported, simply
+                # recomputed on the next build, and never evict cached pairs,
+                # so an unchanged over-cap history causes no rewrite.
+                if (cached is not None
+                        or len(pair_cache) < MATCHED_PACE_CACHE_MAX_PAIRS):
+                    pair_cache[pair_key] = {
+                        "signature": pair_signature,
+                        "windows": per_window,
+                    }
+                    changed = True
+            for window in rules:
+                result[window].append(per_window[window])
+    # Only a lowered cap can leave the cache oversized; trim the oldest once.
+    while len(pair_cache) > MATCHED_PACE_CACHE_MAX_PAIRS:
+        del pair_cache[next(iter(pair_cache))]
+        changed = True
+    data = {
+        "method": "nearest workload match on context, input, output, cache, model calls, tools, and recency",
+        "min_pairs": MATCHED_PACE_MIN_PAIRS,
+        "min_coverage": MATCHED_PACE_MIN_COVERAGE,
+        "windows": result,
+    }
+    return data, changed
+
+
+def matched_pace_windows(sample_groups, now_ts=None, persistent=True):
+    """Build pairwise matched-pace comparisons for every dashboard history window.
+
+    ``persistent=False`` is the project scope: it computes from a private pair
+    cache and never reads, evicts, overwrites, or persists global entries.
+    """
     today = datetime.date.fromtimestamp(float(now_ts if now_ts is not None else time.time()))
     digest = hashlib.sha256(today.isoformat().encode("utf-8"))
     signature_fields = (
@@ -6806,53 +7316,44 @@ def matched_pace_windows(sample_groups, now_ts=None):
             digest.update(repr(values).encode("utf-8", errors="replace"))
     signature = digest.hexdigest()
 
-    with _matched_pace_cache_lock:
-        if (
-            _matched_pace_cache.get("signature") == signature
-            and _matched_pace_cache.get("data") is not None
-        ):
-            return copy.deepcopy(_matched_pace_cache["data"])
+    if not persistent:
+        data, _ = _build_matched_pace_windows(
+            sample_groups, today, signature_fields, {},
+        )
+        return data
 
-        rules = {
-            "today": ("exact", today.isoformat()),
-            "yesterday": ("exact", (today - datetime.timedelta(days=1)).isoformat()),
-            "7": ("since", (today - datetime.timedelta(days=6)).isoformat()),
-            "30": ("since", (today - datetime.timedelta(days=29)).isoformat()),
-            "90": ("since", (today - datetime.timedelta(days=89)).isoformat()),
-            "all": ("all", ""),
-        }
-        result = {window: [] for window in rules}
-        ids = sorted(sample_groups)
-        windowed_samples = {}
-        for runtime_id in ids:
-            buckets = {window: [] for window in rules}
-            for sample in sample_groups[runtime_id]:
-                day = str(sample.get("day") or "")
-                for window, (match, boundary) in rules.items():
-                    if (
-                        match == "all"
-                        or (match == "exact" and day == boundary)
-                        or (match == "since" and day >= boundary)
-                    ):
-                        buckets[window].append(sample)
-            windowed_samples[runtime_id] = buckets
-        for a_index, a_id in enumerate(ids):
-            for b_id in ids[a_index + 1:]:
-                distance_cache = {}
-                for window in rules:
-                    result[window].append(matched_pace_comparison(
-                        a_id, windowed_samples[a_id][window],
-                        b_id, windowed_samples[b_id][window],
-                        distance_cache=distance_cache,
-                    ))
-        data = {
-            "method": "nearest workload match on context, input, output, cache, model calls, tools, and recency",
-            "min_pairs": MATCHED_PACE_MIN_PAIRS,
-            "min_coverage": MATCHED_PACE_MIN_COVERAGE,
-            "windows": result,
-        }
-        _matched_pace_cache["signature"] = signature
-        _matched_pace_cache["data"] = data
+    while True:
+        with _matched_pace_cache_lock:
+            if (
+                _matched_pace_cache.get("signature") == signature
+                and _matched_pace_cache.get("data") is not None
+            ):
+                return copy.deepcopy(_matched_pace_cache["data"])
+
+        # Only one thread rebuilds at a time. A rebuild takes seconds on a large
+        # history; running the same one concurrently saturates the CPU and every
+        # other cross-session request waits behind it on the cache lock.
+        with _matched_pace_build_condition:
+            if _matched_pace_build_state["building"]:
+                _matched_pace_build_condition.wait(timeout=5)
+                continue
+            _matched_pace_build_state["building"] = True
+        data = None
+        try:
+            _ensure_matched_pace_cache_loaded()
+            data, changed = _build_matched_pace_windows(
+                sample_groups, today, signature_fields, _matched_pace_pair_cache,
+            )
+            if changed:
+                _save_matched_pace_pair_cache()
+        finally:
+            if data is not None:
+                with _matched_pace_cache_lock:
+                    _matched_pace_cache["signature"] = signature
+                    _matched_pace_cache["data"] = data
+            with _matched_pace_build_condition:
+                _matched_pace_build_state["building"] = False
+                _matched_pace_build_condition.notify_all()
         return copy.deepcopy(data)
 
 
@@ -6930,20 +7431,91 @@ def delivery_project_label(value):
 def git_delivery_candidates(sources=None):
     """Derive bounded repository candidates from already-discovered projects."""
     candidates = []
+    candidates_by_repository = {}
+    seen_repositories = set()
     seen_roots = set()
+    alias_count = 0
+    service = git_delivery_service()
     for source in list(sources or ()):
         raw_project = source.get("project") if isinstance(source, dict) else ""
         if project_filter_key(raw_project) == OTHER_LOCAL_SESSIONS_PROJECT:
             continue
         root = os.path.abspath(os.path.expanduser(raw_project))
-        project = delivery_project_label(raw_project)
-        if len(root) > 4096 or not project or root in seen_roots:
+        if len(root) > 4096 or root in seen_roots or not os.path.isdir(root):
             continue
-        candidates.append({"root": root, "project": project})
         seen_roots.add(root)
-        if len(candidates) >= 50:
-            break
+        repository_key = service.repository_key(root)
+        if not repository_key:
+            continue
+        project = delivery_project_label(raw_project)
+        if not project:
+            continue
+        existing = candidates_by_repository.get(repository_key)
+        if existing is not None:
+            aliases = existing.setdefault("aliases", [])
+            if (
+                alias_count < MAX_QUERY_PROJECTS
+                and not any(alias.get("root") == root for alias in aliases)
+            ):
+                aliases.append({"root": root, "project": project})
+                alias_count += 1
+            continue
+        if repository_key in seen_repositories or len(candidates) >= MAX_REPOSITORIES + 1:
+            continue
+        candidate = {"root": root, "project": project, "repo_key": repository_key}
+        candidates.append(candidate)
+        candidates_by_repository[repository_key] = candidate
+        seen_repositories.add(repository_key)
     return candidates
+
+
+def publish_git_delivery_candidates(candidates, revision=None, signature=None):
+    """Atomically publish a bounded private candidate snapshot after a Git scan."""
+    global _SOURCE_INVENTORY
+    rows = []
+    for candidate in tuple(candidates or ())[:MAX_REPOSITORIES + 1]:
+        if not isinstance(candidate, dict):
+            continue
+        root = candidate.get("root")
+        project = candidate.get("project")
+        repo_key = candidate.get("repo_key")
+        if not all(isinstance(value, str) and value for value in (root, project, repo_key)):
+            continue
+        aliases = []
+        for alias in tuple(candidate.get("aliases") or ())[:MAX_QUERY_PROJECTS]:
+            if not isinstance(alias, dict):
+                continue
+            alias_root = alias.get("root")
+            alias_project = alias.get("project")
+            if isinstance(alias_root, str) and alias_root and isinstance(alias_project, str) and alias_project:
+                aliases.append({"root": alias_root, "project": alias_project})
+        row = {"root": root, "project": project, "repo_key": repo_key}
+        if aliases:
+            row["aliases"] = tuple(aliases)
+        rows.append(row)
+    with _source_inventory_lock:
+        inventory = _SOURCE_INVENTORY
+        revision = inventory.get("revision") if revision is None else revision
+        signature = inventory.get("git_delivery_source_signature") if signature is None else signature
+        if (
+            revision != inventory.get("revision")
+            or signature != inventory.get("git_delivery_source_signature")
+        ):
+            return False
+        _SOURCE_INVENTORY = dict(
+            inventory,
+            git_delivery_candidates=tuple(rows),
+            git_delivery_candidates_revision=revision,
+        )
+    return True
+
+
+def cached_git_delivery_candidates():
+    """Return the watcher-owned Git candidate snapshot without invoking Git."""
+    inventory = source_inventory_snapshot()
+    if inventory.get("git_delivery_candidates_revision") != inventory.get("revision"):
+        return ()
+    return inventory.get("git_delivery_candidates") or ()
 
 
 def delivery_spend_rows(internal_rows):
@@ -7040,6 +7612,51 @@ def delivery_spend_rows(internal_rows):
     return rows
 
 
+def delivery_model_spend_rows(internal_rows):
+    """Project daily covered cost by model, runtime, and reasoning effort."""
+    rows = {}
+    for session in internal_rows or ():
+        project = delivery_project_label(session.get("project"))
+        availability = session.get("availability") or {}
+        if not project or availability.get("cost") is False:
+            continue
+        model_daily = [
+            daily for daily in session.get("_model_daily") or ()
+            if isinstance(daily, dict)
+        ]
+        models = {
+            str(stats.get("model") or "unknown-model")
+            for stats in [*(session.get("model_stats") or []), *model_daily]
+            if isinstance(stats, dict)
+        }
+        efforts = _domain_session_model_reasoning_efforts(session, models)
+        runtime = (
+            session.get("runtime") or source_runtime_label(session)
+            or session.get("label") or session.get("provider") or "unknown"
+        )
+        for daily in model_daily:
+            day = daily.get("day")
+            if not isinstance(day, str) or len(day) != 10:
+                continue
+            if (daily.get("availability") or {}).get("cost") is False:
+                continue
+            try:
+                cost = float(daily.get("cost") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(cost) or cost <= 0:
+                continue
+            model = str(daily.get("model") or "unknown-model")
+            key = (project, day, model, runtime, efforts.get(model, ""))
+            target = rows.setdefault(key, {
+                "project": project, "day": day, "model": model,
+                "runtime": runtime, "reasoning_effort": efforts.get(model, ""),
+                "covered_cost": 0.0,
+            })
+            target["covered_cost"] += cost
+    return list(rows.values())
+
+
 def git_delivery_service():
     """Return the process-local service backed by Token Meter's private ledger."""
     global _git_delivery_service_instance
@@ -7054,7 +7671,8 @@ def git_delivery_service():
 def bootstrap_git_delivery():
     """Seed readable local push history from the interactive installer context."""
     sources = all_session_sources()
-    return git_delivery_service().scan(git_delivery_candidates(sources))
+    candidates = git_delivery_candidates(sources)
+    return git_delivery_service().scan(candidates)
 
 
 def git_delivery_state(project="", range_key="7"):
@@ -7062,14 +7680,16 @@ def git_delivery_state(project="", range_key="7"):
     if _xsess.get("data") is None:
         cross_session()
     internal_rows = _xsess.get("internal_rows") or ()
-    candidates = git_delivery_candidates(_SOURCE_INVENTORY.get("sources") or ())
-    projects = sorted({candidate["project"] for candidate in candidates})
+    candidates = cached_git_delivery_candidates()
+    eligible = candidates[:MAX_REPOSITORIES]
+    projects = sorted({candidate["project"] for candidate in eligible})
     return git_delivery_service().query(
         project,
         range_key,
         delivery_spend_rows(internal_rows),
         projects,
-        candidates,
+        eligible,
+        model_spend_rows=delivery_model_spend_rows(internal_rows),
     )
 
 
@@ -7086,7 +7706,8 @@ def git_delivery_watcher():
     """Inspect local successful-push reflogs every five minutes."""
     next_scan_at = 0.0
     while True:
-        if not _SOURCE_INVENTORY.get("ready"):
+        inventory = source_inventory_snapshot()
+        if not inventory.get("ready"):
             _git_delivery_wake.wait(1.0)
             _git_delivery_wake.clear()
             continue
@@ -7095,86 +7716,31 @@ def git_delivery_watcher():
             _git_delivery_wake.clear()
             time.sleep(remaining)
             continue
-        candidates = git_delivery_candidates(_SOURCE_INVENTORY.get("sources") or ())
+        candidates = git_delivery_candidates(inventory.get("sources") or ())
         git_delivery_service().scan(candidates)
+        publish_git_delivery_candidates(
+            candidates,
+            inventory.get("revision"),
+            inventory.get("git_delivery_source_signature"),
+        )
         next_scan_at = time.monotonic() + GIT_DELIVERY_INTERVAL_S
 
 
-def aggregate_model_stats(session_rows):
+def aggregate_model_stats(session_rows, global_scope=True):
+    # Project-scoped stats see a subset of samples; they must not evict or
+    # overwrite the persisted global pair cache.
+    matched_pace = (
+        matched_pace_windows if global_scope
+        else functools.partial(matched_pace_windows, persistent=False)
+    )
     return _domain_aggregate_model_stats(
         session_rows,
         runtime_resolver=source_runtime_label,
         throughput_finalizer=_finalize_throughput_fields,
-        matched_pace=matched_pace_windows,
+        matched_pace=matched_pace,
         project_option_limit=MODEL_PROJECT_OPTION_LIMIT,
         project_resolver=project_filter_key,
     )
-
-
-def aggregate_language_signals(session_rows, terms=None):
-    """Aggregate Positive and Friction lexical evidence without retaining messages."""
-    settings = language_signal_settings()
-    configured = {
-        group: list((terms or {}).get(group, settings[group]))
-        for group in ("positive", "friction")
-    }
-    results = {}
-    for group in ("positive", "friction"):
-        events = []
-        for session in session_rows or []:
-            runtime = session.get("runtime") or source_runtime_label(session)
-            stored = session.get("_language_signal_events") or {}
-            source_events = stored.get(group) if isinstance(stored, dict) else None
-            if source_events is None and group == "friction":
-                source_events = session.get("_frustration_events") or []
-            for source_event in source_events or []:
-                event = dict(source_event)
-                model = event.get("model") or "unknown"
-                event["runtime"] = runtime
-                event["model_id"] = f"{model}::{runtime}"
-                events.append(event)
-        result = rollup_frustration_events(events)
-
-        def session_rollup(session):
-            stored = session.get("language_signals") or {}
-            if isinstance(stored, dict) and group in stored:
-                return stored.get(group) or {}
-            return (session.get("frustration") or {}) if group == "friction" else {}
-
-        result.update({
-            "group": group,
-            "configured_terms": configured[group],
-            "default_terms": list(settings["defaults"][group]),
-            "max_terms": settings["max_terms"],
-            "matched_sessions": sum(
-                1 for session in (session_rows or [])
-                if (session_rollup(session).get("utterances") or 0) > 0
-            ),
-            "affected_sessions": sum(
-                1 for session in (session_rows or [])
-                if (session_rollup(session).get("utterances") or 0) > 0
-            ),
-            "sessions_with_user_turns": sum(
-                1 for session in (session_rows or [])
-                if (session_rollup(session).get("user_turns") or 0) > 0
-            ),
-            "method": settings["method"],
-        })
-        results[group] = result
-    return {
-        "positive": results["positive"],
-        "friction": results["friction"],
-        "configured_terms": configured,
-        "default_terms": settings["defaults"],
-        "max_terms": settings["max_terms"],
-        "method": settings["method"],
-    }
-
-
-def aggregate_frustration(session_rows, terms=None):
-    """Backward-compatible aggregate for the Friction language-signal group."""
-    configured = None if terms is None else {"friction": terms}
-    return aggregate_language_signals(session_rows, configured)["friction"]
 
 
 def metric_coverage(rows, metric):
@@ -7219,16 +7785,76 @@ def canonical_aggregation_sources(sources):
     return result
 
 
+def canonical_agent_sources(sources):
+    """Select one summary source per physical agent without changing accounting."""
+    source_rows = list(sources or ())
+    selected = []
+
+    for source in canonical_aggregation_sources(source_rows):
+        if source.get("provider") in ("claude", "cursor", "pi"):
+            selected.append(source)
+
+    groups = defaultdict(list)
+    for index, source in enumerate(source_rows):
+        provider = source.get("provider")
+        if provider not in ("codex", "opencode"):
+            continue
+        if provider == "opencode":
+            # One OpenCode session id is one physical agent. Select it once so a
+            # child is never summarized twice, and never collapse a child into
+            # its parent or another child.
+            physical_id = str(source.get("id") or "")
+        else:
+            physical_id = str(source.get("physical_trace_id") or "")
+        key = physical_id or "path:" + str(source.get("path") or index)
+        groups[key].append((index, source))
+
+    def rank(indexed_source):
+        _index, source = indexed_source
+        try:
+            activity = float(source.get("mtime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            activity = 0.0
+        try:
+            signature = float(source.get("signature_mtime") or 0)
+        except (TypeError, ValueError, OverflowError):
+            signature = 0.0
+        return (
+            not bool(source.get("_aggregation_canonical")),
+            -activity,
+            -signature,
+            str(source.get("path") or ""),
+        )
+
+    selected_agents = {
+        min(candidates, key=rank)[0] for candidates in groups.values()
+    }
+    selected.extend(
+        source for index, source in enumerate(source_rows)
+        if index in selected_agents
+    )
+    return selected
+
+
 def cross_session(sources=None):
     now = time.time()
     if _xsess["data"] and (now - _xsess["at"] < _XSESS_TTL):
         return _xsess["data"]
 
     internal_rows = []
+    agent_rows = []
 
-    source_rows = canonical_aggregation_sources(
-        list(sources) if sources is not None else all_session_sources()
-    )
+    all_sources = list(sources) if sources is not None else all_session_sources()
+    source_rows = canonical_aggregation_sources(all_sources)
+    agent_source_rows = canonical_agent_sources(all_sources)
+    summarized_rows = {}
+
+    def source_key(source):
+        return (
+            str(source.get("provider") or ""),
+            str(source.get("path") or ""),
+            str(source.get("id") or ""),
+        )
     opencode_conn = None
     if any(source.get("provider") == "opencode" for source in source_rows):
         try:
@@ -7246,9 +7872,26 @@ def cross_session(sources=None):
                 if source.get("provider") == "opencode" and shared_opencode_conn is not None
                 else session_summary(source)
             )
+            summarized_rows[source_key(source)] = row
             if row["turns"] == 0:
                 continue
             internal_rows.append(row)
+
+    for source in agent_source_rows:
+        row = summarized_rows.get(source_key(source))
+        if row is None:
+            row = session_summary(source)
+        if row.get("_agent_records"):
+            agent_rows.append(row)
+
+    agent_groups, unresolved_agents = _domain_build_agent_graph(
+        agent_rows, now=now,
+    )
+    agent_usage = _agent_usage_projection(
+        _domain_aggregate_agent_usage(
+            agent_groups, unresolved=unresolved_agents, now=now,
+        )
+    )
 
     aggregate = _domain_aggregate_cross_session_rows(
         internal_rows, runtime_resolver=source_runtime_label,
@@ -7277,7 +7920,6 @@ def cross_session(sources=None):
         for row in internal_rows
         for sample in (row.get("_wait_samples") or [])
     ])
-    language_signals = aggregate_language_signals(internal_rows)
     data = {
         "generated_at": int(now),
         "sessions": sessions[:60],
@@ -7306,8 +7948,7 @@ def cross_session(sources=None):
         "premium_share": (premium / total) if total else 0.0,
         "providers": aggregate["providers"],
         "model_stats": aggregate_model_stats(internal_rows),
-        "language_signals": language_signals,
-        "frustration": language_signals["friction"],
+        "agent_usage": agent_usage,
         "model_pricing": model_pricing_settings(),
         "budgets": budgets,
         "budget": budget,
@@ -7319,6 +7960,7 @@ def cross_session(sources=None):
         "session_actions": session_action_capability(),
     }
     _xsess["internal_rows"] = tuple(internal_rows)
+    _xsess["agent_groups"] = tuple(agent_groups)
     _xsess["project_model_stats"] = {}
     _xsess["data"], _xsess["at"] = data, now
     return data
@@ -7411,7 +8053,7 @@ def project_model_stats(project):
     ]
     if not matching:
         return {"ok": False, "error": "Project was not found."}, 404
-    stats = aggregate_model_stats(matching)
+    stats = aggregate_model_stats(matching, global_scope=False)
     stats.pop("projects", None)
     stats.pop("projects_truncated", None)
     cache[project] = stats
@@ -7469,6 +8111,46 @@ def spend_logs_state(start_day, end_day):
         "sessions": sessions,
         "total_sessions": len(sessions),
         "total_cost": sum(float(row.get("cost") or 0) for row in sessions),
+    }, 200
+
+
+def compare_sessions_state(raw_ids):
+    """Compare up to four selected traces with a bounded, content-free projection."""
+    keys, error = normalize_compare_ids(raw_ids)
+    if error:
+        return {"ok": False, "error": error}, 400
+    inventory, ready = cached_session_sources()
+    pool = inventory if ready else all_session_sources()
+    by_key = {_compare_trace_key(source): source for source in pool}
+    stem_counts = defaultdict(int)
+    for source in pool:
+        stem_counts[_compare_trace_stem(source)] += 1
+
+    def open_id(row):
+        stem = _compare_trace_stem(row)
+        return stem if stem and stem_counts.get(stem) == 1 else str(row.get("id") or "")
+
+    entries, missing = [], []
+    for key in keys:
+        source = by_key.get(key)
+        state = cached_session_state(source) if source else None
+        if not state:
+            missing.append(key)
+            continue
+        entries.append(_compare_entry(session_summary(source), state, key=key, open_id=open_id(source)))
+    if not entries:
+        return {
+            "ok": False,
+            "error": "The selected sessions could not be loaded.",
+            "missing": missing,
+        }, 404
+    comparison = _compare_sessions(entries)
+    rows = _xsess.get("sessions") or (_xsess.get("data") or {}).get("sessions") or ()
+    return {
+        "ok": True,
+        **comparison,
+        "missing": missing,
+        "matches": _compare_matching_sessions(comparison["sessions"], rows, open_id=open_id),
     }, 200
 
 
@@ -7842,6 +8524,8 @@ def resolve_agent_source(session_id=None, caller=None, sources=None):
         return None, "No matching {} run was found.".format(supported_runtime_phrase())
     selected = max(candidates, key=lambda row: float(row.get("mtime") or 0))
     mtime = float(selected.get("mtime") or 0)
+    # A child run's live activity belongs to its root session's current run.
+    selected = fold_child_source(selected, candidates)
     if not mtime or time.time() - mtime > AGENT_CURRENT_MAX_AGE_S:
         runtime = runtime_display_label(provider) if provider else "agent"
         return None, f"No recent {runtime} run matched the caller's current project."
@@ -7919,6 +8603,129 @@ def agent_no_session(message, panel="summary"):
         "as_of": agent_as_of(),
         "data_scope": "matched_current_run",
         "approximate_fields": [],
+    })
+
+
+def session_budget_snapshot(source, state, settings=None):
+    """Build the bounded budget state shared by dashboard and MCP surfaces."""
+    source = source or {}
+    state = state or {}
+    own_id = str(source.get("id") or "").strip()
+    session_id, root_row, children = session_budget_family(
+        own_id, root_id=folded_child_root_id(source) or None,
+    )
+    budget_usd, source_kind = effective_session_budget(session_id, settings)
+    own_cost_available = metric_available(state, "cost")
+    spend = float(state.get("total_cost") or 0) if own_cost_available else None
+    cost_partial = False
+    if children:
+        # One cap covers the root and every child run: add the cached spend of
+        # each other family member to this session's live spend. Measured
+        # members count even when this session's own cost is unavailable, and
+        # any unavailable member makes the spend a lower bound.
+        others = [row for row in children if str(row.get("id") or "") != own_id]
+        if own_id != session_id and root_row is not None:
+            others.append(root_row)
+        measured = [row for row in others if metric_available(row, "cost")]
+        if measured:
+            spend = (spend or 0.0) + sum(float(row.get("cost") or 0) for row in measured)
+        cost_partial = spend is not None and (
+            not own_cost_available or len(measured) < len(others)
+        )
+    cost_available = spend is not None
+    spend_usd = round(spend, 4) if spend is not None else None
+    percent_used = round((100 * spend_usd / budget_usd), 2) if spend_usd is not None else None
+    remaining_usd = round(budget_usd - spend_usd, 4) if spend_usd is not None else None
+    thresholds = list((normalize_budget_settings(
+        settings if settings is not None else budget_settings()
+    ).get("thresholds") or ()))
+    reached = [value for value in thresholds if percent_used is not None and percent_used >= value]
+    return {
+        "id": session_id,
+        "budget_usd": budget_usd,
+        "source": source_kind,
+        "spend_usd": spend_usd,
+        "remaining_usd": remaining_usd,
+        "percent_used": percent_used,
+        "threshold_state": (
+            "unavailable" if percent_used is None else
+            "exceeded" if percent_used >= 100 else
+            "threshold_reached" if reached else "within_budget"
+        ),
+        "reached_thresholds": reached,
+        "cost_available": cost_available,
+        **({"cost_partial": cost_partial} if children else {}),
+    }
+
+
+def agent_budget(session_id=None, caller=None):
+    source, resolution = resolve_agent_source(session_id=session_id, caller=caller)
+    if not source:
+        return agent_no_session(resolution)
+    state = recompute(source)
+    if not state:
+        return agent_no_session("Token Meter found the run but could not read its metrics.")
+    session = session_budget_snapshot(source, state, budget_settings())
+    return bounded_agent_result({
+        "ok": True,
+        "answer": "Session budget is available for this run.",
+        "evidence": [],
+        "recommended_action": "Use the remaining session budget when deciding whether to continue or narrow scope.",
+        "caveat": "Spend is an estimate when this runtime uses public API rates." + (
+            " Spend is a lower bound: some runs in this session family have no cost evidence."
+            if session.get("cost_partial") else ""
+        ),
+        "dashboard_url": agent_dashboard_url(source.get("id"), "summary"),
+        "as_of": agent_as_of(),
+        "data_scope": "session_budget",
+        "selected_session": agent_session_summary(source),
+        "selection": resolution,
+        "session": session,
+        "approximate_fields": (["cost"] if state.get("cost_approx") and session["cost_available"] else []),
+    })
+
+
+def agent_set_session_budget(session_id=None, budget_usd=None,
+                             expected_current_budget_usd=None, confirm=False,
+                             caller=None):
+    if confirm is not True:
+        raise ValueError("set_session_budget requires confirm: true")
+    source, resolution = resolve_agent_source(session_id=session_id, caller=caller)
+    if not source:
+        return agent_no_session(resolution)
+    budget_id = session_budget_family(
+        source.get("id"), root_id=folded_child_root_id(source) or None,
+    )[0]
+    result = set_session_budget_override(
+        budget_id, budget_usd,
+        expected_current_budget_usd=expected_current_budget_usd,
+    )
+    if not result.get("ok"):
+        raise ValueError(result.get("error") or "Token Meter could not save the session budget.")
+    return agent_budget(session_id=source.get("id"), caller=caller)
+
+
+def agent_set_default_session_budget(budget_usd=None,
+                                     expected_current_budget_usd=None,
+                                     confirm=False):
+    if confirm is not True:
+        raise ValueError("set_default_session_budget requires confirm: true")
+    result = set_default_session_budget_value(
+        budget_usd,
+        expected_current_budget_usd=expected_current_budget_usd,
+    )
+    if not result.get("ok"):
+        raise ValueError(result.get("error") or "Token Meter could not save the default session budget.")
+    return bounded_agent_result({
+        "ok": True,
+        "answer": "Default session budget updated.",
+        "evidence": [],
+        "recommended_action": "Existing session overrides keep their configured caps.",
+        "caveat": "This changes only the default cap, not monthly allocations.",
+        "dashboard_url": agent_dashboard_url(panel="settings-budgets"),
+        "as_of": agent_as_of(),
+        "data_scope": "session_budget",
+        "default_session_budget_usd": result["budgets"]["default_session_budget"],
     })
 
 
@@ -8854,8 +9661,33 @@ def menubar_recent_sessions(sources, selected_id=None, limit=5, summaries=None):
         if key[1] and name and key not in summary_names:
             summary_names[key] = name
 
+    # A child run is listed through its root session, which inherits the
+    # child's newer activity, so the menu never offers a child as its own run.
+    source_list = list(sources or [])
+    root_keys = {
+        (str(row.get("provider") or ""), str(row.get("id") or ""))
+        for row in source_list
+    }
+    child_activity = {}
+    for row in source_list:
+        root_id = folded_child_root_id(row)
+        key = (str(row.get("provider") or ""), root_id)
+        if root_id and key in root_keys:
+            child_activity[key] = max(
+                child_activity.get(key, 0), float(row.get("mtime") or 0),
+            )
+    listed = []
+    for row in source_list:
+        key = (str(row.get("provider") or ""), folded_child_root_id(row))
+        if key[1] and key in root_keys:
+            continue
+        own_key = (str(row.get("provider") or ""), str(row.get("id") or ""))
+        if own_key in child_activity and child_activity[own_key] > float(row.get("mtime") or 0):
+            row = dict(row, mtime=child_activity[own_key])
+        listed.append(row)
+
     ordered, seen = [], set()
-    for source in sorted(sources or [], key=lambda row: -(row.get("mtime") or 0)):
+    for source in sorted(listed, key=lambda row: -(row.get("mtime") or 0)):
         sid = str(source.get("id") or "")
         if not sid or sid in seen:
             continue
@@ -9161,7 +9993,7 @@ def watcher():
         if inventory_refreshed:
             publish_source_inventory(sources)
         nf = (
-            max(sources, key=lambda source: source["mtime"])
+            newest_current_source(sources)
             if inventory_refreshed and sources else cur
         )
         sources_sig = (
@@ -9430,9 +10262,8 @@ class H(BaseHTTPRequestHandler):
         req_path = urlparse(self.path).path
         if req_path not in ("/capability/toggle", "/capability/disable-unused",
                             "/agent-access/toggle", "/session/delete",
-                            "/settings/frustration", "/settings/language-signals",
                             "/settings/model-pricing", "/settings/session-model-identity",
-                            "/settings/budgets", "/settings/updates",
+                            "/settings/budgets", "/settings/session-budget", "/settings/updates",
                             "/git-delivery/clear", "/updates/check", "/updates/install"):
             self.send_error(404)
             return
@@ -9464,26 +10295,6 @@ class H(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._send(json.dumps({"ok": False, "error": "Invalid JSON."}),
                        "application/json", status=400)
-            return
-        if req_path == "/settings/language-signals":
-            result = set_language_signal_terms(payload.get("terms") or payload)
-            if result.get("ok"):
-                _summary_cache.clear()
-                cross = refresh_cross_session_state()
-                result["language_signals"] = cross.get("language_signals") or {}
-                result["frustration"] = cross.get("frustration") or {}
-            self._send(json.dumps(result), "application/json",
-                       status=200 if result.get("ok") else 400)
-            return
-        if req_path == "/settings/frustration":
-            result = set_frustration_terms(payload.get("terms"))
-            if result.get("ok"):
-                _summary_cache.clear()
-                cross = refresh_cross_session_state()
-                result["frustration"] = cross.get("frustration") or {}
-                result["language_signals"] = cross.get("language_signals") or {}
-            self._send(json.dumps(result), "application/json",
-                       status=200 if result.get("ok") else 400)
             return
         if req_path == "/settings/model-pricing":
             if isinstance(payload.get("changes"), list):
@@ -9539,6 +10350,25 @@ class H(BaseHTTPRequestHandler):
                 result["budgets"] = cross.get("budgets") or result["budgets"]
                 result["budget"] = cross.get("budget") or {}
                 result["monthly"] = cross.get("monthly") or []
+            self._send(json.dumps(result), "application/json",
+                       status=200 if result.get("ok") else 400)
+            return
+        if req_path == "/settings/session-budget":
+            session_id = str(payload.get("session_id") or "").strip()
+            source = find_session(session_id) if session_id else None
+            if source is None:
+                result = {"ok": False, "error": "The requested Token Meter session was not found."}
+            else:
+                budget_id = session_budget_family(
+                    session_id, root_id=folded_child_root_id(source) or None,
+                )[0]
+                result = set_session_budget_override(
+                    budget_id, payload.get("budget_usd"),
+                    expected_current_budget_usd=payload.get("expected_current_budget_usd"),
+                )
+                if result.get("ok"):
+                    state = cached_session_state(source) or recompute(source) or {}
+                    result["session_budget"] = session_budget_snapshot(source, state)
             self._send(json.dumps(result), "application/json",
                        status=200 if result.get("ok") else 400)
             return
@@ -9636,7 +10466,10 @@ class H(BaseHTTPRequestHandler):
                     str(row.get("id") or "")
                     for row in (cross.get("current_sessions") or [])
                 }
-                st["ended"] = not live or str((st.get("source") or {}).get("id") or "") not in current_ids
+                live_id = folded_child_root_id(source) or str(
+                    (st.get("source") or {}).get("id") or ""
+                )
+                st["ended"] = not live or live_id not in current_ids
                 st["selected_live"] = live
                 if st.get("timing"):
                     st["timing"]["end_label"] = "Last activity"
@@ -9656,6 +10489,11 @@ class H(BaseHTTPRequestHandler):
             }), "application/json")
         elif req_path == "/logs":
             self._send(json.dumps(log_sessions_state()), "application/json")
+        elif req_path == "/session/compare":
+            payload, status = compare_sessions_state(
+                (parse_qs(parsed.query).get("ids") or [""])[0],
+            )
+            self._send(json.dumps(payload), "application/json", status=status)
         elif req_path == "/spend/logs":
             query = parse_qs(parsed.query)
             payload, status = spend_logs_state(
@@ -9727,12 +10565,10 @@ def application():
                 "budgets": lambda: budget_settings(),
                 "updates": lambda: update_settings(),
                 "model_pricing": lambda: model_pricing_settings(),
-                "language_signals": lambda: language_signal_settings(),
             },
             writers={
                 "budgets": lambda value: set_budget_settings(value),
                 "updates": lambda value: set_update_settings(value),
-                "language_signals": lambda value: set_language_signal_terms(value),
             },
         )
         _APPLICATION = Application(
@@ -9776,6 +10612,9 @@ def application():
                     runtime_descriptors=lambda: runtime_registry().descriptors,
                     now=time.time,
                 ),
+                lambda **kwargs: agent_budget(**kwargs),
+                lambda **kwargs: agent_set_session_budget(**kwargs),
+                lambda **kwargs: agent_set_default_session_budget(**kwargs),
             ),
             current_state=lambda: current_state(),
             cross_session=lambda: cross_session(),
@@ -9786,6 +10625,8 @@ def application():
 
 def main():
     """Run the local HTTP application and its background services."""
+    global _matched_pace_persist
+    _matched_pace_persist = True
     print("Auto-following newest {} sessions. Ctrl-C to stop.".format(
         supported_runtime_phrase()
     ))

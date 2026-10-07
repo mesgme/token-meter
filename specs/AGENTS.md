@@ -20,10 +20,11 @@ Token Meter reads local agent traces, calculates clearly labeled usage estimates
 | `token_meter/runtimes/` | Registered runtime discovery, parsing, revisions, and safe projections |
 | `token_meter/platforms/` | Host paths, process/update policy, and trash behavior |
 | `token_meter/domain/` | Runtime-neutral usage, timing, tools, insights, and aggregates |
+| `token_meter/domain/compare.py` | Content-free session comparison, insights, and same-title matching |
 | `token_meter/projections.py` | Explicit allowlisted public compatibility projections |
 | `page.html` | Entire browser dashboard: markup, styles, routing, and JavaScript |
 | `menubar/TokenMeterMenuBar.swift` | Native AppKit companion, preferences, notifications |
-| `token_meter_mcp.py` | Bounded read-only MCP interface |
+| `token_meter_mcp.py` | Bounded MCP interface; evidence is read-only except explicit confirmed session-budget changes |
 | `tests/test_meter.py` | Server, parser, UI-contract, installer, and Swift-source tests |
 | `tests/test_mcp_server.py` | MCP contract and privacy tests |
 | `runtime-manifest.txt` | Shared source-to-runtime packaging contract |
@@ -74,7 +75,7 @@ Token Meter reads local agent traces, calculates clearly labeled usage estimates
 - Persist machine-wide settings through the existing atomic JSON-write path and action-token-protected HTTP endpoints.
 - New settings require validation, idempotent writes, migration behavior, and tests.
 - Preserve legacy hash routes and stored preferences when changing navigation or native settings.
-- Keep the top-level dashboard order `Sessions → Spend → Models → Efficiency → Git → Learn → Tools → Settings`. Sessions contains `Current sessions` and `All sessions`; All owns cross-session review.
+- Keep the top-level dashboard order `Sessions → Spend → Models → Subagents → Efficiency → Git → Learn → Tools → Settings`. The top-level Subagents page owns only role economics. Sessions contains `Current sessions`, `All sessions`, `Compare`, and `Subagents`; Compare (`#sessions-compare`) owns side-by-side comparison of up to four selected sessions, and Subagents owns child-run `Sessions` and `Issues` investigation. Preserve both `#subagents` and `#sessions-subagents` routes.
 - Global is not a dashboard surface. Keep cross-session aggregation as shared backend data for Sessions All, Daily, Models, Tools, Efficiency, MCP, and the menu bar.
 - Keep the complete machine-wide monthly budget dashboard and controls inside Settings. The native companion may deep-link to `#settings-budgets`; preserve `#budgets` as a compatibility redirect.
 - Use macOS labels such as `⌥`, never `Alt`, in user-facing copy.
@@ -165,18 +166,20 @@ Token Meter reads local agent traces, calculates clearly labeled usage estimates
 - When the user authorizes checking out, reviewing, or managing pull requests,
   post one contributor-facing status reply on each inspected PR after checking
   its current head and discussion. Thank the contributor, state the
-  evidence-backed merge status or next step, say the team will follow up soon,
-  and identify the reply as from Pratik's agent. Do not duplicate an equivalent
-  same-head status reply. The PR-management request is standing approval for
-  these replies only; merges, closes, pushes, review requests, and unrelated
-  actions remain separately gated unless that request explicitly authorizes
-  them.
+  evidence-backed merge status or next step, and identify the reply as from
+  Pratik's agent. Mention a follow-up only when the team owns an actual next
+  action; when the work is complete, do not promise one. Do not duplicate an
+  equivalent same-head status reply. The PR-management request is standing
+  approval for these replies only; merges, closes, pushes, review requests,
+  and unrelated actions remain separately gated unless that request explicitly
+  authorizes them.
 - When a contributor later reports results after Pratik's agent asked them to
   check out or test a pull request, acknowledge every existing discussion
-  thread containing those results. Thank them, say the team will follow up
+  thread containing those results. Thank them, state any actual next action
   without inventing a diagnosis or deadline, and identify the reply as from
-  Pratik's agent. Keep Slack to the same short follow-up contract with no code or
-  procedural next steps. This is standing approval for that narrow acknowledgment.
+  Pratik's agent. Omit a follow-up promise when the work is complete. Keep Slack
+  to the same short follow-up contract with no code or procedural next steps.
+  This is standing approval for that narrow acknowledgment.
 - Commits, pushes, pull requests, reviews posted to GitHub, Slack messages,
   releases, and other external side effects require explicit user approval.
 

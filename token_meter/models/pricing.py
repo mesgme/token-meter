@@ -9,9 +9,12 @@ from token_meter.contracts import EvidenceBasis, PriceQuote
 from .catalog import (
     BUILTIN_MODEL_PRICE_HISTORY,
     BUILTIN_PRICE_TABLES,
+    CURSOR_EFFORT_SUFFIX_RE,
+    CURSOR_UNPRICED_VARIANTS,
     CURSOR_VARIANT_MODEL_IDS,
     MODEL_PRICE_FIELDS,
     MODEL_PROVIDER_IDS,
+    OPENAI_FAST_MODEL_IDS,
 )
 
 
@@ -129,6 +132,12 @@ def _model_alias_candidates(model_id, provider_id=None):
             alias = native_id[len(prefix):]
             if alias and alias not in candidates:
                 candidates.append(alias)
+    if provider == "cursor":
+        # Cursor appends reasoning effort to model ids; effort does not change rates.
+        for candidate in tuple(candidates):
+            stripped = CURSOR_EFFORT_SUFFIX_RE.sub("", candidate)
+            if stripped and stripped not in candidates:
+                candidates.append(stripped)
     return candidates
 
 
@@ -169,6 +178,15 @@ def quote_for(query, effective_table=None):
         if effective_table is None else effective_table
     )
     model_id = query.model.model_id
+    if provider_id == "openai":
+        if query.model.variant in ("fast", "priority"):
+            rule, _prices = matching_price(model_id, table, provider_id)
+            if rule in OPENAI_FAST_MODEL_IDS:
+                model_id = rule + "-fast"
+            elif rule not in tuple(model + "-fast" for model in OPENAI_FAST_MODEL_IDS):
+                return PriceQuote.unavailable(query.model)
+        elif query.model.variant not in (None, "standard", "default", "auto"):
+            return PriceQuote.unavailable(query.model)
     if provider_id == "cursor":
         for cursor_model_id in CURSOR_VARIANT_MODEL_IDS:
             if model_alias_matches(model_id, provider_id, cursor_model_id):
@@ -176,6 +194,9 @@ def quote_for(query, effective_table=None):
                     cursor_model_id, query.model.variant or "",
                 )
                 break
+        else:
+            if query.model.variant in CURSOR_UNPRICED_VARIANTS:
+                return PriceQuote.unavailable(query.model)
     matched_rule, prices = matching_price(model_id, table, provider_id)
     if prices is None:
         return PriceQuote.unavailable(query.model)
